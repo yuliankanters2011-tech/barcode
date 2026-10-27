@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""Small Synology inventory web app with a raw USB-HID scanner reader.
+
+The USB reader uses Linux usbfs directly (ctypes + USBDEVFS URBs), so it has
+no pip dependencies. It temporarily unbinds only the scanner's keyboard
+interface and attempts to rebind it on shutdown.
+"""
+
+import ctypes
+import errno
+from contextlib import contextmanager
+import glob
+import json
+import os
+import signal
+import sqlite3
+import threading
+import time
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+DB_PATH = os.environ.get("DB_PATH", "/data/scanbase.db")
+PORT = int(os.environ.get("PORT", "8080"))
+USB_SYSFS = os.environ.get("USB_SYSFS_DEVICES", "/sys/bus/usb/devices")
+USB_HID_DRIVER = os.environ.get("USB_HID_DRIVER_DIR", "/host-usbhid")
+VID, PID = "5131", "2007"
+INTERFACE_NUMBER = 0
+
+# Linux ioctl encoding and USBDEVFS structures (DS218+ is x86_64).
+_IOC_READ = 2
+_IOC_WRITE = 1
+
+def ioc(direction, kind, number, size):
+    return (direction << 30) | (size << 16) | (ord(kind) << 8) | number
+
+
+class UsbDevfsUrb(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_ubyte), ("endpoint", ctypes.c_ubyte),
+        ("status", ctypes.c_int), ("flags", ctypes.c_uint),
+        ("buffer", ctypes.c_void_p), ("buffer_length", ctypes.c_int),
+        ("actual_length", ctypes.c_int), ("start_frame", ctypes.c_int),
+        ("number_of_packets", ctypes.c_int), ("error_count", ctypes.c_int),
+        ("signr", ctypes.c_uint), ("usercontext", ctypes.c_void_p),
+    ]
+
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.ioctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p]
+libc.ioctl.restype = ctypes.c_int
+URB_SIZE = ctypes.sizeof(UsbDevfsUrb)
+IO_SUBMIT = ioc(_IOC_READ, "U", 10, URB_SIZE)
+IO_DISCARD = (ord("U") << 8) | 11
+IO_REAP = ioc(_IOC_WRITE, "U", 12, ctypes.sizeof(ctypes.c_void_p))
+IO_REAP_NDELAY = ioc(_IOC_WRITE, "U", 13, ctypes.sizeof(ctypes.c_void_p))
+IO_CLAIM = ioc(_IOC_READ, "U", 15, ctypes.sizeof(ctypes.c_uint))
+IO_RELEASE = ioc(_IOC_READ, "U", 16, ctypes.sizeof(ctypes.c_uint))
+
+stop_event = threading.Event()
+scanner_status = {"state": "starting", "message": "Scanner wordt gezocht"}
+scanner_status_lock = threading.Lock()
+scan_lock = threading.Lock()
+scan_events = []
+scan_counter = 0
+usb_state_lock = threading.Lock()
+usb_state = {"fd": None, "urb": None, "pending": False}
+
+
+def set_scanner_status(state, message):
+    with scanner_status_lock:
+        scanner_status.update(state=state, message=message)
+
+
+def ioctl_ptr(fd, request, obj):
+    ctypes.set_errno(0)
+    if libc.ioctl(fd, request, ctypes.byref(obj)) < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def text_file(path):
+    with open(path, "r", encoding="ascii") as stream:
+        return stream.read().strip()
+
+
+def locate_scanner():
+    for vendor_path in glob.glob(os.path.join(USB_SYSFS, "*", "idVendor")):
+        device_dir = os.path.dirname(vendor_path)
+        try:
+            if text_file(vendor_path).lower() != VID:
+                continue
+            if text_file(os.path.join(device_dir, "idProduct")).lower() != PID:
+                continue
+            bus = int(text_file(os.path.join(device_dir, "busnum")))
+            dev = int(text_file(os.path.join(device_dir, "devnum")))
+            device_name = os.path.basename(device_dir)
+            interface_name = f"{device_name}:1.{INTERFACE_NUMBER}"
+            interface_dir = os.path.join(USB_SYSFS, interface_name)
+            if not os.path.isdir(interface_dir):
+                raise RuntimeError("USB interface 0 niet gevonden")
+            endpoint = None
+            packet_size = None
+            for ep in glob.glob(os.path.join(interface_dir, "ep_*")):
+                address = int(text_file(os.path.join(ep, "bEndpointAddress")), 16)
+                attributes = int(text_file(os.path.join(ep, "bmAttributes")), 16)
+                if address & 0x80 and (attributes & 0x03) == 0x03:
+                    endpoint = address
+                    packet_size = int(text_file(os.path.join(ep, "wMaxPacketSize")), 16) & 0x7ff
+                    break
+            if endpoint is None or not packet_size:
+                raise RuntimeError("Interrupt-IN USB-endpoint ontbreekt")
+            node = f"/dev/bus/usb/{bus:03d}/{dev:03d}"
+            return device_name, interface_name, interface_dir, node, endpoint, packet_size
+        except (OSError, ValueError):
+            continue
+    raise RuntimeError(f"Scanner USB-ID {VID}:{PID} niet gevonden")
+
+
+# Standard USB HID keyboard usage mapping. HID usage 0x2B (Tab) is the
+# suffix observed on this scanner; Enter and keypad Enter are also accepted.
+def key_to_text(code, shift):
+    if 0x04 <= code <= 0x1D:
+        ch = chr(ord("a") + code - 0x04)
+        return ch.upper() if shift else ch
+    if 0x1E <= code <= 0x27:
+        digits = "1234567890"
+        shifted = "!@#$%^&*()"
+        index = code - 0x1E
+        return shifted[index] if shift else digits[index]
+    if code == 0x2C:
+        return " "
+    punctuation = {
+        0x2D: ("-", "_"), 0x2E: ("=", "+"), 0x2F: ("[", "{"),
+        0x30: ("]", "}"), 0x31: ("\\", "|"), 0x33: (";", ":"),
+        0x34: ("'", '"'), 0x35: ("`", "~"), 0x36: (",", "<"),
+        0x37: (".", ">"), 0x38: ("/", "?"),
+    }
+    pair = punctuation.get(code)
+    return pair[1 if shift else 0] if pair else ""
+
+
+def record_scan(code):
+    global scan_counter
+    code = code.strip()
+    if not code:
+        return
+    with scan_lock:
+        scan_counter += 1
+        scan_events.append({"id": scan_counter, "code": code,
+                            "time": datetime.now(timezone.utc).isoformat()})
+        del scan_events[:-100]
+    print(f"Scan ontvangen: {code}", flush=True)
+
+
+def consume_hid_report(report, previous_keys, current_code):
+    if len(report) < 8:
+        return previous_keys, current_code
+    modifiers = report[0]
+    shift = bool(modifiers & 0x22)
+    keys = {key for key in report[2:8] if key}
+    for key in keys - previous_keys:
+        if key in (0x28, 0x2B, 0x58):
+            if current_code:
+                record_scan(current_code)
+            current_code = ""
+        else:
+            current_code += key_to_text(key, shift)
+            if len(current_code) > 512:
+                current_code = ""
+    return keys, current_code
+
+
+def scanner_worker():
+    fd = None
+    detached = False
+    claimed = False
+    urb_pending = False
+    interface_name = None
+    urb = None
+    buf = None
+    try:
+        device_name, interface_name, interface_dir, node, endpoint, packet_size = locate_scanner()
+        print(f"Scanner gevonden op {node}, endpoint 0x{endpoint:02x}", flush=True)
+        fd = os.open(node, os.O_RDWR)
+
+        unbind_path = os.path.join(USB_HID_DRIVER, "unbind")
+        bind_path = os.path.join(USB_HID_DRIVER, "bind")
+        driver_link = os.path.join(interface_dir, "driver")
+        current_driver = os.path.basename(os.path.realpath(driver_link)) if os.path.exists(driver_link) else ""
+        if current_driver == "usbhid":
+            with open(unbind_path, "w", encoding="ascii") as stream:
+                stream.write(interface_name)
+            detached = True
+            time.sleep(0.2)
+        elif current_driver:
+            raise RuntimeError(f"Interface gebruikt onverwachte driver: {current_driver}")
+
+        interface = ctypes.c_uint(INTERFACE_NUMBER)
+        ioctl_ptr(fd, IO_CLAIM, interface)
+        claimed = True
+
+        buf = ctypes.create_string_buffer(packet_size)
+        urb = UsbDevfsUrb()
+        urb.type = 1  # interrupt transfer
+        urb.endpoint = endpoint
+        urb.buffer = ctypes.addressof(buf)
+        urb.buffer_length = packet_size
+        ioctl_ptr(fd, IO_SUBMIT, urb)
+        urb_pending = True
+        with usb_state_lock:
+            usb_state.update(fd=fd, urb=urb, pending=True)
+        set_scanner_status("ready", "USB-scanner luistert")
+
+        previous_keys = set()
+        current_code = ""
+        while not stop_event.is_set():
+            completion = ctypes.c_void_p()
+            try:
+                ioctl_ptr(fd, IO_REAP, completion)
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                if stop_event.is_set():
+                    break
+                raise
+            urb_pending = False
+            with usb_state_lock:
+                usb_state["pending"] = False
+            if urb.status:
+                raise OSError(-urb.status, f"USB-transferstatus {urb.status}")
+            report = bytes(buf.raw[:urb.actual_length])
+            previous_keys, current_code = consume_hid_report(report, previous_keys, current_code)
+            if stop_event.is_set():
+                break
+            urb.status = 0
+            urb.actual_length = 0
+            ioctl_ptr(fd, IO_SUBMIT, urb)
+            urb_pending = True
+            with usb_state_lock:
+                usb_state["pending"] = True
+
+    except Exception as exc:
+        set_scanner_status("error", str(exc))
+        print(f"Scannerfout: {type(exc).__name__}: {exc}", flush=True)
+    finally:
+        if fd is not None and urb_pending and urb is not None:
+            try:
+                ioctl_ptr(fd, IO_DISCARD, urb)
+                completion = ctypes.c_void_p()
+                try:
+                    ioctl_ptr(fd, IO_REAP_NDELAY, completion)
+                except OSError:
+                    pass
+            except OSError:
+                pass
+        if fd is not None and claimed:
+            try:
+                interface = ctypes.c_uint(INTERFACE_NUMBER)
+                ioctl_ptr(fd, IO_RELEASE, interface)
+            except OSError:
+                pass
+        with usb_state_lock:
+            usb_state.update(fd=None, urb=None, pending=False)
+        if fd is not None:
+            os.close(fd)
+        if detached and interface_name:
+            try:
+                with open(os.path.join(USB_HID_DRIVER, "bind"), "w", encoding="ascii") as stream:
+                    stream.write(interface_name)
+                print("Scanner-driver opnieuw aangekoppeld", flush=True)
+            except OSError as exc:
+                set_scanner_status("error", f"Scanner-driver kon niet terug: {exc}")
+                print(f"WAARSCHUWING: usbhid niet teruggekoppeld: {exc}", flush=True)
+        if not stop_event.is_set() and scanner_status["state"] != "error":
+            set_scanner_status("offline", "Scannerluisteraar gestopt")
+
+
+def stop_usb_reader():
+    stop_event.set()
+    with usb_state_lock:
+        fd = usb_state.get("fd")
+        urb = usb_state.get("urb")
+        pending = usb_state.get("pending")
+        if fd is not None and urb is not None and pending:
+            try:
+                ioctl_ptr(fd, IO_DISCARD, urb)
+            except OSError:
+                pass
+
+
+DB_LOCK = threading.Lock()
+
+
+def db_connect():
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@contextmanager
+def db_session():
+    conn = db_connect()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def init_db():
+    with db_session() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            barcode TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            location TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_items_name ON items(name)")
+
+
+def row_to_dict(row):
+    return dict(row) if row is not None else None
+
+
+def get_item_by_barcode(code):
+    with DB_LOCK, db_session() as conn:
+        row = conn.execute("SELECT * FROM items WHERE barcode=?", (code,)).fetchone()
+        return row_to_dict(row)
+
+
+def json_bytes(value):
+    return json.dumps(value, ensure_ascii=False).encode("utf-8")
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ScanBase/1.0"
+
+    def log_message(self, fmt, *args):
+        print("HTTP:", fmt % args, flush=True)
+
+    def send_json(self, value, status=200):
+        body = json_bytes(value)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def read_json(self):
+        size = int(self.headers.get("Content-Length", "0"))
+        if size > 100_000:
+            raise ValueError("Aanvraag te groot")
+        raw = self.rfile.read(size)
+        return json.loads(raw or b"{}")
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        if parsed.path == "/":
+            body = PAGE.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == "/api/status":
+            with scanner_status_lock:
+                status = dict(scanner_status)
+            self.send_json({"scanner": status})
+            return
+        if parsed.path == "/api/scans":
+            try:
+                after = int(params.get("after", ["0"])[0])
+            except ValueError:
+                after = 0
+            with scan_lock:
+                events = [event for event in scan_events if event["id"] > after]
+            self.send_json({"scans": events})
+            return
+        if parsed.path == "/api/search":
+            q = params.get("q", [""])[0].strip()
+            if not q:
+                self.send_json({"items": []})
+                return
+            like = f"%{q}%"
+            with DB_LOCK, db_session() as conn:
+                rows = conn.execute("""SELECT * FROM items
+                    WHERE barcode LIKE ? OR name LIKE ? OR location LIKE ? OR notes LIKE ?
+                    ORDER BY name COLLATE NOCASE LIMIT 60""", (like, like, like, like)).fetchall()
+            self.send_json({"items": [row_to_dict(r) for r in rows]})
+            return
+        if parsed.path == "/api/item":
+            try:
+                item_id = int(params.get("id", [""])[0])
+            except ValueError:
+                self.send_json({"error": "Ongeldig ID"}, 400)
+                return
+            with DB_LOCK, db_session() as conn:
+                row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                self.send_json({"error": "Niet gevonden"}, 404)
+            else:
+                self.send_json({"item": row_to_dict(row)})
+            return
+        if parsed.path == "/api/by-barcode":
+            code = params.get("code", [""])[0]
+            self.send_json({"item": get_item_by_barcode(code)})
+            return
+        self.send_json({"error": "Niet gevonden"}, 404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        try:
+            data = self.read_json()
+        except Exception as exc:
+            self.send_json({"error": str(exc)}, 400)
+            return
+        if parsed.path == "/api/save":
+            barcode = str(data.get("barcode", "")).strip()
+            name = str(data.get("name", "")).strip()
+            location = str(data.get("location", "")).strip()
+            notes = str(data.get("notes", "")).strip()
+            item_id = data.get("id")
+            if not barcode or not name:
+                self.send_json({"error": "Barcode en naam zijn verplicht"}, 400)
+                return
+            try:
+                with DB_LOCK, db_session() as conn:
+                    if item_id:
+                        conn.execute("""UPDATE items SET barcode=?, name=?, location=?, notes=?,
+                            updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                            (barcode, name, location, notes, int(item_id)))
+                        row = conn.execute("SELECT * FROM items WHERE id=?", (int(item_id),)).fetchone()
+                    else:
+                        conn.execute("""INSERT INTO items(barcode,name,location,notes)
+                            VALUES(?,?,?,?) ON CONFLICT(barcode) DO UPDATE SET
+                            name=excluded.name, location=excluded.location, notes=excluded.notes,
+                            updated_at=CURRENT_TIMESTAMP""", (barcode, name, location, notes))
+                        row = conn.execute("SELECT * FROM items WHERE barcode=?", (barcode,)).fetchone()
+                self.send_json({"item": row_to_dict(row)})
+            except sqlite3.IntegrityError as exc:
+                self.send_json({"error": f"Barcode bestaat al: {exc}"}, 409)
+            except (ValueError, TypeError) as exc:
+                self.send_json({"error": str(exc)}, 400)
+            return
+        if parsed.path == "/api/delete":
+            try:
+                item_id = int(data.get("id"))
+            except (TypeError, ValueError):
+                self.send_json({"error": "Ongeldig ID"}, 400)
+                return
+            with DB_LOCK, db_session() as conn:
+                conn.execute("DELETE FROM items WHERE id=?", (item_id,))
+            self.send_json({"ok": True})
+            return
+        self.send_json({"error": "Niet gevonden"}, 404)
+
+
+PAGE = r'''<!doctype html>
+<html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ScanBase — voorraad</title><style>
+:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#eaf0ff;background:#0b1020;--panel:#151d33;--line:#283451;--muted:#a4b0ca;--accent:#73e0c1;--blue:#6da8ff}
+*{box-sizing:border-box}body{margin:0}header{padding:22px max(20px,calc((100% - 1100px)/2));display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);background:#10172a;gap:14px}h1{font-size:22px;margin:0}header p{margin:4px 0 0;color:var(--muted);font-size:13px}.status{font-size:13px;padding:8px 12px;border:1px solid var(--line);border-radius:999px;color:var(--muted)}.status.ready{color:var(--accent);border-color:#286956}.status.error{color:#ff9292;border-color:#8c3b46}
+main{max-width:1100px;margin:24px auto;padding:0 18px;display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;box-shadow:0 10px 30px #0002}.card h2{font-size:17px;margin:0 0 16px}.wide{grid-column:1/-1}.scanbox{padding:14px;border-radius:12px;background:#0f1830;border:1px solid #273858;margin-bottom:18px}.scanbox small{color:var(--muted)}#lastScan{font-size:23px;font-weight:700;margin-top:4px;word-break:break-all;color:var(--accent)}label{display:block;font-size:13px;color:var(--muted);margin:13px 0 6px}input,textarea{font:inherit;width:100%;padding:11px 12px;border-radius:9px;border:1px solid #364461;background:#0e1527;color:#f5f7ff;outline:none}input:focus,textarea:focus{border-color:var(--blue);box-shadow:0 0 0 3px #6da8ff22}textarea{min-height:85px;resize:vertical}.buttons{display:flex;gap:9px;flex-wrap:wrap;margin-top:16px}button{font:inherit;border:0;border-radius:9px;padding:10px 14px;cursor:pointer;background:#283653;color:#edf3ff}button.primary{background:#69d8b6;color:#071b18;font-weight:700}button.danger{background:#492632;color:#ffb5b5}button:hover{filter:brightness(1.12)}.results{display:grid;gap:8px;margin-top:12px}.result{width:100%;text-align:left;padding:12px;border:1px solid var(--line);background:#111a2e}.result strong{display:block}.result span{display:block;color:var(--muted);font-size:13px;margin-top:3px}.hint,#message{color:var(--muted);font-size:13px}.empty{padding:14px;color:var(--muted);font-size:14px}.footer{max-width:1100px;margin:0 auto 25px;padding:0 18px;color:#7e8ba8;font-size:12px}@media(max-width:760px){main{grid-template-columns:1fr}.wide{grid-column:auto}header{align-items:flex-start;flex-direction:column}}
+</style></head><body>
+<header><div><h1>ScanBase</h1><p>Voorraad, barcodes en locaties</p></div><div id="status" class="status">Scanner verbinden…</div></header>
+<main><section class="card"><h2>Scanner</h2><div class="scanbox"><small>Laatste scan</small><div id="lastScan">Nog niets gescand</div></div><p class="hint">Scan een artikel. Bekende artikelen worden geopend; onbekende codes kun je toevoegen.</p></section>
+<section class="card"><h2>Zoeken</h2><label for="search">Zoek op naam, barcode, locatie of notitie</label><input id="search" autocomplete="off" placeholder="Bijvoorbeeld: boormachine of kast A2"><div id="results" class="results"><div class="empty">Typ om artikelen te zoeken.</div></div></section>
+<section class="card wide"><h2 id="formTitle">Artikel toevoegen of wijzigen</h2><input type="hidden" id="itemId"><label for="barcode">Barcode</label><input id="barcode" autocomplete="off" placeholder="Scan of typ een barcode"><label for="name">Naam</label><input id="name" autocomplete="off" placeholder="Bijvoorbeeld: accuboormachine"><label for="location">Locatie</label><input id="location" autocomplete="off" placeholder="Bijvoorbeeld: schuur, kast A2"><label for="notes">Notities</label><textarea id="notes" placeholder="Extra informatie (optioneel)"></textarea><div class="buttons"><button class="primary" id="save">Opslaan</button><button id="clear">Leegmaken</button><button class="danger" id="delete" hidden>Verwijderen</button></div><p id="message" role="status"></p></section></main><div class="footer">De database staat lokaal op de NAS. Houd deze pagina alleen beschikbaar op je eigen netwerk.</div>
+<script>
+const $=id=>document.getElementById(id);let lastId=0;let searchTimer;
+function setMessage(t){$('message').textContent=t||''}
+function clearForm(){ $('itemId').value='';$('barcode').value='';$('name').value='';$('location').value='';$('notes').value='';$('formTitle').textContent='Artikel toevoegen of wijzigen';$('delete').hidden=true;setMessage('') }
+function fillForm(item){$('itemId').value=item?.id||'';$('barcode').value=item?.barcode||'';$('name').value=item?.name||'';$('location').value=item?.location||'';$('notes').value=item?.notes||'';$('formTitle').textContent=item?'Artikel wijzigen':'Nieuw artikel';$('delete').hidden=!item;setMessage(item?'Artikel geladen.':'Onbekende barcode — vul een naam en locatie in.')}
+async function loadByBarcode(code){$('lastScan').textContent=code;try{let r=await fetch('/api/by-barcode?code='+encodeURIComponent(code));let d=await r.json();fillForm(d.item||{barcode:code})}catch(e){setMessage('Kon artikel niet laden: '+e.message)}}
+async function pollScans(){try{let d=await (await fetch('/api/scans?after='+lastId)).json();for(const s of d.scans){lastId=s.id;await loadByBarcode(s.code)}}catch(e){}setTimeout(pollScans,500)}
+async function refreshStatus(){try{let d=await (await fetch('/api/status')).json(),s=d.scanner;$('status').textContent=s.message;$('status').className='status '+(s.state==='ready'?'ready':s.state==='error'?'error':'')}catch(e){$('status').textContent='Verbinding met NAS mislukt'}setTimeout(refreshStatus,2000)}
+function showResults(items){let root=$('results');root.replaceChildren();if(!items.length){root.innerHTML='<div class="empty">Geen artikelen gevonden.</div>';return}for(const item of items){let b=document.createElement('button');b.className='result';let strong=document.createElement('strong');strong.textContent=item.name;let span=document.createElement('span');span.textContent=(item.location||'Geen locatie')+' · '+item.barcode;b.append(strong,span);b.onclick=()=>fillForm(item);root.appendChild(b)}}
+$('search').addEventListener('input',()=>{clearTimeout(searchTimer);let q=$('search').value.trim();if(!q){$('results').innerHTML='<div class="empty">Typ om artikelen te zoeken.</div>';return}searchTimer=setTimeout(async()=>{try{let d=await (await fetch('/api/search?q='+encodeURIComponent(q))).json();showResults(d.items)}catch(e){}},220)});
+$('save').onclick=async()=>{let payload={id:$('itemId').value||null,barcode:$('barcode').value.trim(),name:$('name').value.trim(),location:$('location').value.trim(),notes:$('notes').value.trim()};try{let r=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});let d=await r.json();if(!r.ok)throw Error(d.error||'Opslaan mislukt');fillForm(d.item);$('lastScan').textContent=d.item.barcode;setMessage('Opgeslagen.');if($('search').value.trim())$('search').dispatchEvent(new Event('input'))}catch(e){setMessage(e.message)}};
+$('clear').onclick=clearForm;
+$('delete').onclick=async()=>{if(!confirm('Dit artikel verwijderen?'))return;try{let r=await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:$('itemId').value})});let d=await r.json();if(!r.ok)throw Error(d.error||'Verwijderen mislukt');clearForm();setMessage('Artikel verwijderd.');if($('search').value.trim())$('search').dispatchEvent(new Event('input'))}catch(e){setMessage(e.message)}};
+pollScans();refreshStatus();
+</script></body></html>'''
+
+
+def make_server():
+    return ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+
+
+def main():
+    init_db()
+    worker = threading.Thread(target=scanner_worker, name="usb-hid-reader", daemon=True)
+    worker.start()
+    server = make_server()
+
+    def request_stop(signum, frame):
+        stop_event.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    print(f"ScanBase draait op 0.0.0.0:{PORT}", flush=True)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        stop_usb_reader()
+        server.server_close()
+        worker.join(timeout=8)
+        print("ScanBase gestopt", flush=True)
+
+
+if __name__ == "__main__":
+    main()

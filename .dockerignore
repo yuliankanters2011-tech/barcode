@@ -1,0 +1,10 @@
+.git
+.github
+__pycache__
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+data
+README.md
+docker-compose*.yml

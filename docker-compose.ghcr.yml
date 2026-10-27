@@ -1,0 +1,20 @@
+services:
+  scanbase:
+    # Change YOUR_GITHUB_NAME/YOUR_REPOSITORY after the first successful Actions run.
+    image: ghcr.io/YOUR_GITHUB_NAME/YOUR_REPOSITORY:latest
+    container_name: scanbase
+    restart: unless-stopped
+    stop_grace_period: 20s
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      DB_PATH: /data/scanbase.db
+      USB_SYSFS_DEVICES: /sys/bus/usb/devices
+      USB_HID_DRIVER_DIR: /host-usbhid
+    privileged: true
+    volumes:
+      - ./data:/data
+      - /dev/bus/usb:/dev/bus/usb
+      - /sys/bus/usb/devices:/sys/bus/usb/devices:ro
+      - /sys/bus/usb/drivers/usbhid:/host-usbhid:rw
