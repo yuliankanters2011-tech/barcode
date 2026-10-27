@@ -1,0 +1,226 @@
+yulian-aleen@nas-voor-coder:~$ yulian-aleen@nas-voor-coder:~$
+-sh: yulian-aleen@nas-voor-coder:~$: command not found
+yulian-aleen@nas-voor-coder:~$
+yulian-aleen@nas-voor-coder:~$
+yulian-aleen@nas-voor-coder:~$
+yulian-aleen@nas-voor-coder:~$
+yulian-aleen@nas-voor-coder:~$
+yulian-aleen@nas-voor-coder:~$
+yulian-aleen@nas-voor-coder:~$ sudo python3 - <<'PY'
+> import ctypes, errno, glob, os, time
+>
+> VID, PID = "5131", "2007"
+> libc = ctypes.CDLL(None, use_errno=True)
+> libc.ioctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p]
+> libc.ioctl.restype = ctypes.c_int
+>
+> class URB(ctypes.Structure):
+>     _fields_ = [
+>         ("type", ctypes.c_ubyte), ("endpoint", ctypes.c_ubyte),
+>         ("status", ctypes.c_int), ("flags", ctypes.c_uint),
+>         ("buffer", ctypes.c_void_p), ("buffer_length", ctypes.c_int),
+>         ("actual_length", ctypes.c_int), ("start_frame", ctypes.c_int),
+>         ("number_of_packets", ctypes.c_int), ("error_count", ctypes.c_int),
+>         ("signr", ctypes.c_uint), ("usercontext", ctypes.c_void_p)
+>     ]
+>
+> def ioc(direction, letter, number, size):
+>     return (direction << 30) | (size << 16) | (ord(letter) << 8) | number
+>
+> def ioctl(fd, request, obj):
+>     ctypes.set_errno(0)
+>     if libc.ioctl(fd, request, ctypes.byref(obj)) < 0:
+raise OSError(err, os.strerror(err))
+
+submit = ioc(2, "U", 10, ctypes.sizeof(URB))
+discard = (ord("U") << 8) | 11
+reap = ioc(1, "U", 12, ctypes.sizeof(ctypes.c_void_p))
+reap_nowait = ioc(1, "U", 13, ctypes.sizeof(ctypes.c_void_p))
+claim = ioc(2, "U", 15, ctypes.sizeof(ctypes.c_uint))
+release = ioc(2, "U", 16, ctypes.sizeof(ctypes.c_uint))
+
+fd = None
+detached = False
+claimed = False
+pending = False
+urb = None
+interface = None
+
+try:
+    device_dir = None
+    for p in glob.glob(>         err = ctypes.get_errno()
+>         raise OSError(err, os.strerror(err))
+>
+> submit = ioc(2, "U", 10, ctypes.sizeof(URB))
+> discard = (ord("U") << 8) | 11
+> reap = ioc(1, "U", 12, ctypes.sizeof(ctypes.c_void_p))
+> reap_nowait = ioc(1, "U", 13, ctypes.sizeof(ctypes.c_void_p))
+> claim = ioc(2, "U", 15, ctypes.sizeof(ctypes.c_uint))
+> release = ioc(2, "U", 16, ctypes.sizeof(ctypes.c_uint))
+>
+> fd = None
+> detached = False
+> claimed = False
+> pending = False
+> urb = None
+> interface = None
+>
+> try:
+>     device_dir = None
+>     for p in glob.glob("/sys/bus/usb/devices/*/idVendor"):
+>         d = os.path.dirname(p)
+>         try:
+>             if open(p).read().strip().lower() == VID and \
+>                open(os.path.join(d, "idProduct")).read().strip().lower() == PID:
+>                 device_dir = d
+>                 break
+>         except OSError:
+>             pass
+>
+>     if device_dir is None:
+>         raise RuntimeError("Scanner 5131:2007 niet gevonden")
+>
+>     interface = os.path.basename(device_dir) + ":1.0"
+>     interface_dir = "/sys/bus/usb/devices/" + interface
+>     driver = os.path.realpath(os.path.join(interface_dir, "driver"))
+>     if os.path.basename(driver) != "usbhid":
+>         raise RuntimeError("Interface 0 gebruikt niet de verwachte usbhid-driver")
+>
+pen(os.path.join(device_dir, "devnum")).read())
+    node = f"/dev/bus/usb/{bus:0>     endpoint = None
+>     packet_size = None
+>     for ep in glob.glob(os.path.join(interface_dir, "ep_*")):
+>         addr = int(open(os.path.join(ep, "bEndpointAddress")).read().strip(), 16)
+>         attr = int(open(os.path.join(ep, "bmAttributes")).read().strip(), 16)
+>         if addr & 0x80 and (attr & 3) == 3:
+>             endpoint = addr
+>             packet_size = int(open(os.path.join(ep, "wMaxPacketSize")).read().strip(), 16) & 0x7ff
+>             break
+>     if endpoint is None or not packet_size:
+>         raise RuntimeError("Geen interrupt-IN USB-endpoint gevonden")
+>
+>     bus = int(open(os.path.join(device_dir, "busnum")).read())
+>     dev = int(open(os.path.join(device_dir, "devnum")).read())
+>     node = f"/dev/bus/usb/{bus:03d}/{dev:03d}"
+>     print(f"Scanner gevonden: {node}, endpoint 0x{endpoint:02x}", flush=True)
+>
+>     fd = os.open(node, os.O_RDWR)
+>     with open("/sys/bus/usb/drivers/usbhid/unbind", "w") as f:
+>         f.write(interface)
+>     detached = True
+>     time.sleep(0.2)
+>
+>     interface_number = ctypes.c_uint(0)
+>     ioctl(fd, claim, interface_number)
+>     claimed = True
+>
+>     buf = ctypes.create_string_buffer(packet_size)
+>     urb = URB()
+>     urb.type = 1
+>     urb.endpoint = endpoint
+>     urb.buffer = ctypes.addressof(buf)
+>     urb.buffer_length = packet_size
+>
+>     ioctl(fd, submit, urb)
+ompleted = ctypes.c_void_p()
+        try:
+            ioctl(fd, reap, completed)
+        except >     pending = True
+>     print("Klaar. Scan nu een barcode; stop met Ctrl+C.", flush=True)
+>
+>     while True:
+>         completed = ctypes.c_void_p()
+>         try:
+>             ioctl(fd, reap, completed)
+>         except OSError as e:
+>             if e.errno == errno.EINTR:
+
+        pending = False
+        if urb.status:
+            raise OSError(-urb.s>                 continue
+>             raise
+tatus, f"USB-fou>
+>         pending = False
+>         if urb.status:
+>             raise OSError(-urb.status, f"USB-foutstatus {urb.status}")
+>
+>         report = bytes(buf.raw[:urb.actual_length])
+>         if any(report):
+>             print("HID report:", report.hex(" "), flush=True)
+>
+>         urb.status = 0
+>         urb.actual_length = 0
+>         ioctl(fd, submit, urb)
+>         pending = True
+xcept KeyboardIn>
+> except KeyboardInterrupt:
+>     print("\nTest gestopt.", flush=True)
+> except Exception as e:
+>     print(f"\nTestfout: {type(e).__name__}: {e}", flush=True)
+> finally:
+>     if fd is not None and pending and urb is not None:
+>         try:
+>             ioctl(fd, discard, urb)
+>             done = ctypes.c_void_p()
+>             ioctl(fd, reap_nowait, done)
+>         except OSError:
+>             pass
+>     if fd is not None and claimed:
+>         try:
+>             interface_number = ctypes.c_uint(0)
+>             ioctl(fd, release, interface_number)
+>         except OSError:
+>             pass
+>     if fd is not None:
+ver niet automatisch teruggekoppeld: {e}", flush=True)
+            print(f"Herstel met: sudo sh -c 'echo {interface} > /sys/bus/usb/drivers/usbhid/bind'")
+            print("De scanner uit- en>         os.close(fd)
+>     if detached and interface:
+>         try:
+>             with open("/sys/bus/usb/drivers/usbhid/bind", "w") as f:
+>                 f.write(interface)
+>             print("Scanner-driver weer aangekoppeld.", flush=True)
+>         except OSError as e:
+>             print(f"Driver niet automatisch teruggekoppeld: {e}", flush=True)
+>             print(f"Herstel met: sudo sh -c 'echo {interface} > /sys/bus/usb/drivers/usbhid/bind'")
+>             print("De scanner uit- en weer inpluggen kan ook helpen.")
+> PY
+Password:
+Scanner gevonden: /dev/bus/usb/001/004, endpoint 0x81
+Klaar. Scan nu een barcode; stop met Ctrl+C.
+HID report: 00 00 26 00 00 00 00 00
+HID report: 00 00 27 00 00 00 00 00
+HID report: 00 00 20 00 00 00 00 00
+HID report: 00 00 22 00 00 00 00 00
+HID report: 00 00 24 00 00 00 00 00
+HID report: 00 00 22 00 00 00 00 00
+HID report: 00 00 22 00 00 00 00 00
+HID report: 00 00 25 00 00 00 00 00
+HID report: 00 00 2b 00 00 00 00 00
+HID report: 00 00 26 00 00 00 00 00
+HID report: 00 00 27 00 00 00 00 00
+HID report: 00 00 20 00 00 00 00 00
+HID report: 00 00 22 00 00 00 00 00
+HID report: 00 00 24 00 00 00 00 00
+HID report: 00 00 22 00 00 00 00 00
+HID report: 00 00 22 00 00 00 00 00
+HID report: 00 00 25 00 00 00 00 00
+HID report: 00 00 2b 00 00 00 00 00
+HID report: 00 00 26 00 00 00 00 00
+HID report: 00 00 27 00 00 00 00 00
+HID report: 00 00 20 00 00 00 00 00
+HID report: 00 00 22 00 00 00 00 00
+HID report: 00 00 24 00 00 00 00 00
+HID report: 00 00 22 00 00 00 00 00
+HID report: 00 00 22 00 00 00 00 00
+HID report: 00 00 25 00 00 00 00 00
+HID report: 00 00 2b 00 00 00 00 00
+HID report: 00 00 26 00 00 00 00 00
+HID report: 00 00 27 00 00 00 00 00
+HID report: 00 00 20 00 00 00 00 00
+HID report: 00 00 22 00 00 00 00 00
+HID report: 00 00 24 00 00 00 00 00
+HID report: 00 00 22 00 00 00 00 00
+HID report: 00 00 22 00 00 00 00 00
+HID report: 00 00 25 00 00 00 00 00
+HID report: 00 00 2b 00 00 00 00 00
