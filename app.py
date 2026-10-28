@@ -24,6 +24,7 @@ DB_PATH = os.environ.get("DB_PATH", "/data/scanbase.db")
 PORT = int(os.environ.get("PORT", "8080"))
 USB_SYSFS = os.environ.get("USB_SYSFS_DEVICES", "/sys/bus/usb/devices")
 USB_HID_DRIVER = os.environ.get("USB_HID_DRIVER_DIR", "/host-usbhid")
+SCANNER_MODE = os.environ.get("SCANNER_MODE", "external").lower()
 VID, PID = "5131", "2007"
 INTERFACE_NUMBER = 0
 
@@ -421,6 +422,15 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.send_json({"error": str(exc)}, 400)
             return
+        if parsed.path == "/api/ingest":
+            code = str(data.get("code", "")).strip()
+            if not code or len(code) > 512:
+                self.send_json({"error": "Ongeldige barcode"}, 400)
+                return
+            record_scan(code)
+            set_scanner_status("ready", "Scans ontvangen via NAS-brug")
+            self.send_json({"ok": True})
+            return
         if parsed.path == "/api/save":
             barcode = str(data.get("barcode", "")).strip()
             name = str(data.get("name", "")).strip()
@@ -496,8 +506,12 @@ def make_server():
 
 def main():
     init_db()
-    worker = threading.Thread(target=scanner_worker, name="usb-hid-reader", daemon=True)
-    worker.start()
+    worker = None
+    if SCANNER_MODE == "external":
+        set_scanner_status("waiting", "Wacht op scannerbrug op de NAS")
+    else:
+        worker = threading.Thread(target=scanner_worker, name="usb-hid-reader", daemon=True)
+        worker.start()
     server = make_server()
 
     def request_stop(signum, frame):
@@ -506,13 +520,14 @@ def main():
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    print(f"ScanBase draait op 0.0.0.0:{PORT}", flush=True)
+    print(f"ScanBase draait op 0.0.0.0:{PORT} (scanner_mode={SCANNER_MODE})", flush=True)
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
-        stop_usb_reader()
+        if worker:
+            stop_usb_reader()
+            worker.join(timeout=8)
         server.server_close()
-        worker.join(timeout=8)
         print("ScanBase gestopt", flush=True)
 
 

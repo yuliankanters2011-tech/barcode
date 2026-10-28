@@ -1,54 +1,55 @@
-# ScanBase voor Synology + GitHub Actions
+# ScanBase — Synology, Docker Hub en NAS-scannerbrug
 
-ScanBase is een kleine Nederlandstalige voorraadwebapp met SQLite. De GitHub Actions-workflow bouwt bij iedere push automatisch een Docker-image en publiceert die bij GitHub Container Registry (GHCR). De app gebruikt geen pip-pakketten.
+ScanBase is een Nederlandstalige voorraadwebapp met SQLite. Omdat de gewone Synology-containerwizard geen host-systeemmap zoals `/dev/bus/usb` kan koppelen, werkt deze variant met twee delen:
 
-## Scanner en veiligheid
+1. De webapp en database draaien in een gewone Docker-container.
+2. Een klein Python-hulp-script draait op de Synology zelf als root, leest de HID-scanner en stuurt barcodes naar de webapp via `http://127.0.0.1:8081`.
 
-- De USB-lezer gebruikt Linux usbfs rechtstreeks. De HID-rapporten van de HZTZ-scanner zijn op de NAS getest; de getoonde reeks kwam overeen met `90357558` plus Tab.
-- De container krijgt `privileged`-rechten, toegang tot `/dev/bus/usb` en schrijft tijdelijk naar de `usbhid`-driverinterface om alleen de toetsenbordinterface van de scanner los en weer vast te koppelen. Gebruik dit uitsluitend op een vertrouwd thuisnetwerk.
-- De webapp heeft geen wachtwoord. Stel poort 8080 niet rechtstreeks open voor internet.
-- De USB-toegang vanuit Docker moet nog op jouw Synology worden bevestigd. Als de container de USB- of sysfs-mount weigert, plak dan de exacte Container Manager-log.
+De NAS-test heeft bevestigd dat de scanner ruwe HID-toetsrapporten doorgeeft; de geteste barcode was `90357558` met Tab als afsluittoets. De webapp ontvangt de helper-invoer via `/api/ingest`.
 
-## De projectmap naar GitHub uploaden
+## Veiligheid
 
-1. Pak `scanbase-docker.zip` uit op je Windows-pc.
-2. Installeer/open **GitHub Desktop** en meld je aan bij GitHub.
-3. Kies **File → Add local repository** en selecteer de uitgepakte map `scanbase-docker`. Als GitHub Desktop zegt dat het nog geen repository is, kies **create a repository** en selecteer die map.
-4. Kies **Publish repository**. De map moet als repository-root de bestanden `Dockerfile`, `app.py`, `docker-compose.yml` en de map `.github/workflows/` bevatten.
-5. Wacht op de workflow onder het tabblad **Actions**. Die bouwt de image; bij een push naar de standaardbranch publiceert hij de tag `latest` naar GHCR.
+- Het hulp-script draait als root omdat het de USB-toetsenbordinterface kort loskoppelt en na afsluiten probeert terug te koppelen.
+- ScanBase zelf heeft geen wachtwoord. Houd poort 8081 op je eigen netwerk; stel die niet open voor internet.
+- Stop de eerdere handmatige USB-test met Ctrl+C voordat je de helper start.
 
-Je hoeft geen GitHub Actions-secret aan te maken: de workflow gebruikt `GITHUB_TOKEN`.
+## GitHub Actions → Docker Hub
 
-## Image gebruiken op de Synology
+De workflow staat in `.github/workflows/build-publish.yml` en bouwt/pusht de image naar `docker.io/ykdigital/scanbase:latest`.
 
-Na de eerste geslaagde Actions-run:
+1. Maak op Docker Hub een repository `scanbase`.
+2. Maak een Docker Hub access token met Read & Write.
+3. Voeg in GitHub bij **Settings → Secrets and variables → Actions** deze repository secrets toe:
+   - `DOCKERHUB_USERNAME` = `ykdigital`
+   - `DOCKERHUB_TOKEN` = je Docker Hub access token
+4. Upload/push de bijgewerkte projectbestanden naar GitHub. Wacht tot **Actions** groen is; dan is de bijgewerkte image gepubliceerd.
 
-1. Open de GHCR-package die bij je GitHub-repository hoort. GitHub maakt de eerste package vaak privé. Maak hem openbaar als je de image op de NAS zonder login wilt ophalen. Wil je hem privé houden, dan moet je op DSM eerst bij `ghcr.io` inloggen met een GitHub-token met `read:packages`.
-2. Open `docker-compose.ghcr.yml` en vervang `YOUR_GITHUB_NAME/YOUR_REPOSITORY` door bijvoorbeeld `yulian-aleen/scanbase` (gebruik de eigen account- en repositorynaam).
-3. Pak de projectmap uit in een gedeelde map op de NAS. Zorg dat `data/` naast de compose-bestanden staat.
-4. Stop eventuele USB-testscript(s) op de NAS met **Ctrl+C** en controleer dat `usbhid` opnieuw aan de scanner is gekoppeld. Laat de scanner aangesloten.
-5. Open **Container Manager → Project → Maken**, kies de projectmap en selecteer `docker-compose.ghcr.yml`. Start het project.
-6. Open `http://IP-VAN-JE-NAS:8080`.
+## ScanBase-container maken via de gewone DSM-wizard (geen Project)
 
-De database blijft bewaard in `data/scanbase.db`, ook wanneer de container opnieuw wordt gemaakt. Maak daarvan af en toe een reservekopie.
+1. Zorg dat de nieuwe GitHub Actions-run is geslaagd, zodat `ykdigital/scanbase:latest` de bijgewerkte app bevat.
+2. In Container Manager: haal de nieuwste image op en maak de container `ykdigital/scanbase:latest` aan.
+3. Stel de poort in op NAS/lokaal `8081` → container `8080`, TCP.
+4. Koppel de bestaande NAS-map `/volume1/docker/scanbase/data` aan `/data` met lezen/schrijven.
+5. Zet, indien de wizard dit toont, `SCANNER_MODE` op `external`, `PORT` op `8080` en `DB_PATH` op `/data/scanbase.db`. Laat `PATH` ongemoeid.
+6. Je hebt voor deze variant geen privileged-modus of `/dev`- en `/sys`-volumemounts nodig in de container.
+7. Start de container. De database blijft in `/volume1/docker/scanbase/data/scanbase.db`.
 
-## Lokaal bouwen op de NAS
+Open daarna `http://IP-VAN-JE-NAS:8081`.
 
-De gewone `docker-compose.yml` bouwt dezelfde app lokaal vanaf `Dockerfile` en `app.py`. In Container Manager kun je die compose-file kiezen in plaats van de GHCR-variant.
+## NAS-scannerbrug instellen via DSM Taakplanner
 
-## Handmatig via SSH
+Kopieer `usb_scan_bridge.py` naar `/volume1/docker/scanbase/usb_scan_bridge.py`. Maak daarna een taak:
 
-Lokaal bouwen (als `docker compose` beschikbaar is):
-
-```sh
-cd /volume1/docker/scanbase
-sudo docker compose up -d --build
-sudo docker compose logs -f
-```
-
-Stoppen:
+1. Open **Configuratiescherm → Taakplanner → Maken → Geactiveerde taak → Door gebruiker gedefinieerd script**.
+2. Kies als gebruiker **root** en als gebeurtenis **Opstarten**.
+3. Vul bij het gebruikersscript in:
 
 ```sh
-cd /volume1/docker/scanbase
-sudo docker compose down
+python3 /volume1/docker/scanbase/usb_scan_bridge.py
 ```
+
+4. Sla de taak op en voer hem één keer handmatig uit om te testen. Laat de scanner aangesloten.
+
+De helper probeert bij het starten de vereiste HID-modules te laden als die nog niet geladen zijn. Hij luistert naar USB-ID `5131:2007`, leest Tab/Enter als einde van de barcode en stuurt de code naar de container via poort 8081. Na een scan hoort die in ScanBase te verschijnen.
+
+Als de taak niet start, controleer dan de taakdetails en de containerlogs. Als de container meldt dat de helper-invoer niet aankomt, controleer dat de containerpoort op de NAS werkelijk `8081` is.

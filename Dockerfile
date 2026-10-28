@@ -7,7 +7,8 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=8080 \
     DB_PATH=/data/scanbase.db \
     USB_SYSFS_DEVICES=/sys/bus/usb/devices \
-    USB_HID_DRIVER_DIR=/host-usbhid
+    USB_HID_DRIVER_DIR=/host-usbhid \
+    SCANNER_MODE=external
 
 EXPOSE 8080
 CMD ["python3", "-u", "/app/app.py"]

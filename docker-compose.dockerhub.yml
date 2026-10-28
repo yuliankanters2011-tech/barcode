@@ -1,20 +1,14 @@
 services:
   scanbase:
-    # Replace YOUR_DOCKERHUB_USERNAME with your Docker Hub account name.
+    # Image wordt door GitHub Actions naar Docker Hub gepubliceerd.
     image: docker.io/ykdigital/scanbase:latest
     container_name: scanbase
     restart: unless-stopped
-    stop_grace_period: 20s
     ports:
-      - "8080:8080"
+      - "8081:8080"
     environment:
       PORT: "8080"
       DB_PATH: /data/scanbase.db
-      USB_SYSFS_DEVICES: /sys/bus/usb/devices
-      USB_HID_DRIVER_DIR: /host-usbhid
-    privileged: true
+      SCANNER_MODE: external
     volumes:
-      - ./data:/data
-      - /dev/bus/usb:/dev/bus/usb
-      - /sys/bus/usb/devices:/sys/bus/usb/devices:ro
-      - /sys/bus/usb/drivers/usbhid:/host-usbhid:rw
+      - /volume1/docker/scanbase/data:/data
