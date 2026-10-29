@@ -23,7 +23,7 @@ from urllib.request import Request, urlopen
 
 DB_PATH = os.environ.get("DB_PATH", "/data/scanbase.db")
 PORT = int(os.environ.get("PORT", "8080"))
-LOOKUP_VERSION = 2
+LOOKUP_VERSION = 3
 USB_SYSFS = os.environ.get("USB_SYSFS_DEVICES", "/sys/bus/usb/devices")
 USB_HID_DRIVER = os.environ.get("USB_HID_DRIVER_DIR", "/host-usbhid")
 SCANNER_MODE = os.environ.get("SCANNER_MODE", "external").lower()
@@ -576,6 +576,75 @@ def fetch_google_book(barcode):
     return None
 
 
+def isbn10_from_isbn13(value):
+    """Return a valid ISBN-10 equivalent for a 978 ISBN-13, if possible."""
+    if len(value) != 13 or not value.startswith("978") or not value.isdigit():
+        return ""
+    checksum13 = sum(int(digit) * (1 if index % 2 == 0 else 3)
+                     for index, digit in enumerate(value[:12]))
+    if (10 - checksum13 % 10) % 10 != int(value[12]):
+        return ""
+    body = value[3:12]
+    checksum10 = sum(int(digit) * (10 - index) for index, digit in enumerate(body))
+    remainder = (11 - checksum10 % 11) % 11
+    return body + ("X" if remainder == 10 else str(remainder))
+
+
+def fetch_kb_nbt_book(isbn13):
+    """Search the Dutch KB National Bibliography (NBT), no API key required."""
+    if not (isbn13.startswith("97890") or isbn13.startswith("97894")):
+        return None
+    values = [isbn13]
+    isbn10 = isbn10_from_isbn13(isbn13)
+    if isbn10:
+        values.append(isbn10)
+    isbn_values = " ".join(json.dumps(value) for value in values)
+    query = f"""PREFIX schema: <http://schema.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX dct: <http://purl.org/dc/terms#>
+SELECT ?book ?title ?author ?year ?language ?pages ?publication ?isbn
+WHERE {{
+  VALUES ?isbn {{ {isbn_values} }}
+  ?book schema:isbn ?isbn ; schema:name ?title .
+  OPTIONAL {{ ?book schema:author ?authorId . ?authorId rdfs:label ?author . }}
+  OPTIONAL {{ ?book dct:issued ?year . }}
+  OPTIONAL {{ ?book schema:inLanguage ?language . }}
+  OPTIONAL {{ ?book schema:numberOfPages ?pages . }}
+  OPTIONAL {{ ?book schema:publication ?publicationId . ?publicationId rdfs:label ?publication . }}
+}}"""
+    url = "https://data.bibliotheken.nl/sparql?" + urlencode({"query": query})
+    request = Request(url, headers={"Accept": "application/sparql-results+json",
+                                    "User-Agent": "ScanBase/1.5 (Dutch barcode inventory)"})
+    with urlopen(request, timeout=9) as response:
+        payload = json.loads(response.read(1_000_000).decode("utf-8"))
+    bindings = payload.get("results", {}).get("bindings", [])
+    # Prefer an exact ISBN-13 record; some older national records only store ISBN-10.
+    bindings.sort(key=lambda row: row.get("isbn", {}).get("value") != isbn13)
+    for row in bindings:
+        def value(key):
+            return (row.get(key) or {}).get("value", "").strip()
+        title = value("title")
+        if not title:
+            continue
+        author = value("author")
+        publication = value("publication")
+        year = value("year")
+        pages = value("pages")
+        language = value("language")
+        details = [value for value in (
+            publication, (year if year and year not in publication else ""),
+            f"{pages} pagina's" if pages else "", f"Taal: {language}" if language else "") if value]
+        source_url = value("book").replace("http://", "https://", 1)
+        return {
+            "barcode": isbn13, "found": True, "name": title,
+            "brand": author, "category": "Boek · KB/Nederlandse bibliografie",
+            "quantity": "", "image_url": "", "source": "KB/NBT",
+            "source_url": source_url or "https://data.bibliotheken.nl/sparql",
+            "description": " · ".join(details), "offers": [],
+        }
+    return None
+
+
 def lookup_online(barcode, use_cache=True):
     barcode = str(barcode).strip()
     if use_cache:
@@ -584,6 +653,16 @@ def lookup_online(barcode, use_cache=True):
             return cached
 
     errors = []
+    # Prefer the national source for Dutch ISBNs before spending a general UPC lookup.
+    if len(barcode) == 13 and barcode.startswith(("97890", "97894")):
+        try:
+            item = fetch_kb_nbt_book(barcode)
+            if item:
+                save_catalog_result(item)
+                return item
+        except Exception as exc:
+            errors.append(f"KB/NBT: {type(exc).__name__}")
+
     movie_lookup_attempted = False
     try:
         item = fetch_upcitemdb(barcode)
@@ -630,8 +709,9 @@ def lookup_online(barcode, use_cache=True):
         except Exception as exc:
             errors.append(f"{source_name}: {type(exc).__name__}")
 
-    # MusicBrainz is a specialist barcode source for CD editions.
-    if barcode.isdigit() and 8 <= len(barcode) <= 14:
+    # MusicBrainz is a specialist barcode source for CD editions, not ISBNs.
+    if barcode.isdigit() and 8 <= len(barcode) <= 14 and not (
+            len(barcode) == 13 and barcode.startswith(("978", "979"))):
         try:
             item = fetch_musicbrainz_release(barcode)
             if item:
