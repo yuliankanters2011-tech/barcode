@@ -23,7 +23,7 @@ from urllib.request import Request, urlopen
 
 DB_PATH = os.environ.get("DB_PATH", "/data/scanbase.db")
 PORT = int(os.environ.get("PORT", "8080"))
-LOOKUP_VERSION = 3
+LOOKUP_VERSION = 4
 USB_SYSFS = os.environ.get("USB_SYSFS_DEVICES", "/sys/bus/usb/devices")
 USB_HID_DRIVER = os.environ.get("USB_HID_DRIVER_DIR", "/host-usbhid")
 SCANNER_MODE = os.environ.get("SCANNER_MODE", "external").lower()
@@ -438,6 +438,42 @@ def fetch_fact_product(base, barcode, source_name):
     }
 
 
+def fetch_gtinsearch_product(barcode):
+    """Try the free, open GTIN Search/Datakick catalogue; coverage is community-supplied."""
+    url = "https://www.gtinsearch.org/api/items/" + quote(barcode, safe="")
+    request = Request(url, headers={"Accept": "application/json",
+                                    "User-Agent": "ScanBase/1.6 (open barcode lookup)"})
+    with urlopen(request, timeout=5) as response:
+        payload = json.loads(response.read(1_000_000).decode("utf-8"))
+    if isinstance(payload, list):
+        records = payload
+    elif isinstance(payload, dict):
+        records = payload.get("items") or [payload]
+    else:
+        return None
+    for product in records:
+        if not isinstance(product, dict):
+            continue
+        name = str(product.get("name") or product.get("product_name") or product.get("title") or "").strip()
+        if not name:
+            continue
+        returned_code = str(product.get("gtin") or product.get("gtin14") or product.get("ean") or
+                            product.get("upc") or product.get("barcode") or "").strip()
+        if returned_code and returned_code != barcode and returned_code.lstrip("0") != barcode.lstrip("0"):
+            continue
+        brand = product.get("brand_name") or product.get("brand") or product.get("manufacturer") or ""
+        size = product.get("size") or product.get("quantity") or ""
+        category = product.get("category") or product.get("categories") or ""
+        description = product.get("description") or product.get("ingredients") or ""
+        image = product.get("image_url") or product.get("image") or ""
+        return {"barcode": barcode, "found": True, "name": name, "brand": brand,
+                "category": category, "quantity": size, "image_url": image,
+                "source": "GTIN Search (open productdata)",
+                "source_url": f"https://gtinsearch.org/api/items/{quote(barcode, safe='')}",
+                "description": str(description)[:4000], "offers": []}
+    return None
+
+
 def fetch_upcitemdb(barcode):
     # Free Explorer API: no key required, with a published daily request limit.
     url = "https://api.upcitemdb.com/prod/trial/lookup?" + urlencode({"upc": barcode})
@@ -554,35 +590,44 @@ def fetch_musicbrainz_release(barcode):
 
 
 def fetch_google_book(barcode):
-    """Look up ISBNs in Google Books, which often indexes school editions."""
-    query = urlencode({"q": "isbn:" + barcode, "maxResults": "5"})
-    request = Request("https://www.googleapis.com/books/v1/volumes?" + query,
-                      headers={"Accept": "application/json",
-                               "User-Agent": "ScanBase/1.4 barcode inventory"})
-    with urlopen(request, timeout=7) as response:
-        payload = json.loads(response.read(1_000_000).decode("utf-8"))
-    for result in payload.get("items", []):
-        info = result.get("volumeInfo") or {}
-        identifiers = {str(identifier.get("identifier", "")).replace("-", "")
-                       for identifier in info.get("industryIdentifiers", [])}
-        if barcode not in identifiers or not info.get("title"):
+    """Look up ISBN-10 and ISBN-13 equivalents, useful for older school editions."""
+    candidates = isbn_lookup_candidates(barcode)
+    last_error = None
+    for candidate in candidates:
+        query = urlencode({"q": "isbn:" + candidate, "maxResults": "5"})
+        request = Request("https://www.googleapis.com/books/v1/volumes?" + query,
+                          headers={"Accept": "application/json",
+                                   "User-Agent": "ScanBase/1.6 barcode inventory"})
+        try:
+            with urlopen(request, timeout=7) as response:
+                payload = json.loads(response.read(1_000_000).decode("utf-8"))
+        except Exception as exc:
+            last_error = exc
             continue
-        authors = ", ".join(info.get("authors", []))
-        categories = ", ".join(info.get("categories", []))
-        details = [value for value in (info.get("publisher", ""),
-                                       info.get("publishedDate", ""),
-                                       f"{info['pageCount']} pagina's" if info.get("pageCount") else "",
-                                       categories) if value]
-        image_links = info.get("imageLinks") or {}
-        return {
-            "barcode": barcode, "found": True, "name": info["title"],
-            "brand": authors, "category": categories or "Boek / ISBN",
-            "quantity": "", "image_url": image_links.get("thumbnail", "").replace("http://", "https://"),
-            "source": "Google Books",
-            "source_url": info.get("infoLink") or f"https://books.google.com/books?vid=ISBN{quote(barcode, safe='')}",
-            "description": (info.get("description", "") or "")[:4000] or " · ".join(details),
-            "offers": [],
-        }
+        for result in payload.get("items", []):
+            info = result.get("volumeInfo") or {}
+            identifiers = {str(identifier.get("identifier", "")).replace("-", "")
+                           for identifier in info.get("industryIdentifiers", [])}
+            if not set(candidates).intersection(identifiers) or not info.get("title"):
+                continue
+            authors = ", ".join(info.get("authors", []))
+            categories = ", ".join(info.get("categories", []))
+            details = [value for value in (info.get("publisher", ""),
+                                           info.get("publishedDate", ""),
+                                           f"{info['pageCount']} pagina's" if info.get("pageCount") else "",
+                                           categories) if value]
+            image_links = info.get("imageLinks") or {}
+            return {
+                "barcode": barcode, "found": True, "name": info["title"],
+                "brand": authors, "category": categories or "Boek / ISBN",
+                "quantity": "", "image_url": image_links.get("thumbnail", "").replace("http://", "https://"),
+                "source": "Google Books",
+                "source_url": info.get("infoLink") or f"https://books.google.com/books?vid=ISBN{quote(barcode, safe='')}",
+                "description": (info.get("description", "") or "")[:4000] or " · ".join(details),
+                "offers": [],
+            }
+    if last_error:
+        raise last_error
     return None
 
 
@@ -598,6 +643,40 @@ def isbn10_from_isbn13(value):
     checksum10 = sum(int(digit) * (10 - index) for index, digit in enumerate(body))
     remainder = (11 - checksum10 % 11) % 11
     return body + ("X" if remainder == 10 else str(remainder))
+
+
+def isbn13_from_isbn10(value):
+    """Return the equivalent 978 ISBN-13 when a valid ISBN-10 is scanned."""
+    if (len(value) != 10 or not value[:9].isdigit() or value[-1] not in "0123456789X"
+            or set(value) == {"0"}):
+        return ""
+    values = [int(digit) for digit in value[:9]]
+    check10 = 10 if value[-1] == "X" else int(value[-1])
+    if (sum(digit * (10 - index) for index, digit in enumerate(values)) + check10) % 11 != 0:
+        return ""
+    body = "978" + value[:9]
+    checksum = sum(int(digit) * (1 if index % 2 == 0 else 3) for index, digit in enumerate(body))
+    return body + str((10 - checksum % 10) % 10)
+
+
+def isbn_lookup_candidates(barcode):
+    """Return validated ISBN barcode plus its compatible ISBN-10/13 equivalent."""
+    if len(barcode) == 13 and barcode.startswith(("978", "979")) and barcode.isdigit():
+        checksum = sum(int(digit) * (1 if index % 2 == 0 else 3)
+                       for index, digit in enumerate(barcode[:12]))
+        if (10 - checksum % 10) % 10 != int(barcode[12]):
+            return []
+        equivalent = isbn10_from_isbn13(barcode)
+    elif len(barcode) == 10:
+        equivalent = isbn13_from_isbn10(barcode)
+        if not equivalent:
+            return []
+    else:
+        return []
+    candidates = [barcode]
+    if equivalent:
+        candidates.append(equivalent)
+    return candidates
 
 
 def fetch_kb_nbt_book(isbn13):
@@ -663,11 +742,14 @@ def lookup_online(barcode, use_cache=True):
             return cached
 
     errors = []
-    # Prefer the national source for Dutch ISBNs before spending a general UPC lookup.
-    if len(barcode) == 13 and barcode.startswith(("97890", "97894")):
+    isbn_codes = isbn_lookup_candidates(barcode)
+    isbn13 = next((value for value in isbn_codes if len(value) == 13), "")
+    # Prefer the national source for Dutch ISBNs; this also catches scanned ISBN-10 codes.
+    if isbn13.startswith(("97890", "97894")):
         try:
-            item = fetch_kb_nbt_book(barcode)
+            item = fetch_kb_nbt_book(isbn13)
             if item:
+                item["barcode"] = barcode
                 save_catalog_result(item)
                 return item
         except Exception as exc:
@@ -719,9 +801,17 @@ def lookup_online(barcode, use_cache=True):
         except Exception as exc:
             errors.append(f"{source_name}: {type(exc).__name__}")
 
+    # Free open GTIN catalogue fallback can add non-food and retail products.
+    try:
+        item = fetch_gtinsearch_product(barcode)
+        if item:
+            save_catalog_result(item)
+            return item
+    except Exception as exc:
+        errors.append(f"GTIN Search: {type(exc).__name__}")
+
     # MusicBrainz is a specialist barcode source for CD editions, not ISBNs.
-    if barcode.isdigit() and 8 <= len(barcode) <= 14 and not (
-            len(barcode) == 13 and barcode.startswith(("978", "979"))):
+    if barcode.isdigit() and 8 <= len(barcode) <= 14 and not isbn_codes:
         try:
             item = fetch_musicbrainz_release(barcode)
             if item:
@@ -730,8 +820,9 @@ def lookup_online(barcode, use_cache=True):
         except Exception as exc:
             errors.append(f"MusicBrainz: {type(exc).__name__}")
 
-    # ISBNs may be school editions; Google Books often has publisher/edition details.
-    if len(barcode) in (10, 13) and (barcode.startswith("978") or barcode.startswith("979") or len(barcode) == 10):
+    # Google Books and Open Library now also try the ISBN-10/13 equivalent;
+    # exact identifier matching avoids confusing different editions.
+    if isbn_codes:
         try:
             item = fetch_google_book(barcode)
             if item:
@@ -740,15 +831,15 @@ def lookup_online(barcode, use_cache=True):
         except Exception as exc:
             errors.append(f"Google Books: {type(exc).__name__}")
 
-        # Open Library is a second independent ISBN fallback.
         try:
+            bibkeys = ",".join("ISBN:" + candidate for candidate in isbn_codes)
             url = "https://openlibrary.org/api/books?" + urlencode({
-
-                "bibkeys": "ISBN:" + barcode, "format": "json", "jscmd": "data"})
-            request = Request(url, headers={"User-Agent": "ScanBase/1.2 (barcode inventory; read-only lookup)"})
+                "bibkeys": bibkeys, "format": "json", "jscmd": "data"})
+            request = Request(url, headers={"User-Agent": "ScanBase/1.6 (barcode inventory; read-only lookup)"})
             with urlopen(request, timeout=5) as response:
                 payload = json.loads(response.read(1_000_000).decode("utf-8"))
-            book = payload.get("ISBN:" + barcode)
+            book = next((payload.get("ISBN:" + candidate) for candidate in isbn_codes
+                         if payload.get("ISBN:" + candidate, {}).get("title")), None)
             if book and book.get("title"):
                 authors = ", ".join(a.get("name", "") for a in book.get("authors", []) if a.get("name"))
                 item = {"barcode": barcode, "found": True, "name": book["title"],
@@ -881,7 +972,7 @@ class Handler(BaseHTTPRequestHandler):
             if not code or len(code) > 64:
                 self.send_json({"error": "Voer een geldige barcode in"}, 400)
                 return
-            item = lookup_online(code)
+            item = lookup_online(code, use_cache=params.get("refresh", [""])[0] != "1")
             self.send_json({"item": item, "existing_item": get_item_by_barcode(code),
                             "locations": inventory_locations()})
             return
@@ -1075,11 +1166,11 @@ $('save').onclick=async()=>{let payload={id:$('itemId').value||null,barcode:$('b
 $('clear').onclick=clearForm;
 $('delete').onclick=async()=>{if(!confirm('Dit artikel verwijderen?'))return;try{let r=await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:$('itemId').value})});let d=await r.json();if(!r.ok)throw Error(d.error||'Verwijderen mislukt');clearForm();setMessage('Artikel verwijderd.');loadInventoryList();if($('search').value.trim())$('search').dispatchEvent(new Event('input'))}catch(e){setMessage(e.message)}};
 function addLink(container,label,url){let a=document.createElement('a');a.textContent=label;a.href=url;a.target='_blank';a.rel='noopener noreferrer';container.appendChild(a)}
-function catalogQueryLinks(item){let q=(item.name?item.name+' ':'')+item.barcode;let encoded=encodeURIComponent(q);return {google:'https://www.google.com/search?tbm=shop&q='+encoded,web:'https://www.google.com/search?q='+encoded,bol:'https://www.bol.com/nl/nl/s/?searchtext='+encoded,amazon:'https://www.amazon.nl/s?k='+encoded,marktplaats:'https://www.marktplaats.nl/q/'+encoded+'/',deslegte:'https://www.google.com/search?q='+encodeURIComponent('site:deslegte.com '+q),bookmatch:'https://www.google.com/search?q='+encodeURIComponent('site:bookmatch.nl '+q),bruna:'https://www.google.com/search?q='+encodeURIComponent('site:bruna.nl '+q),discogs:'https://www.discogs.com/search/?q='+encoded+'&type=all'}}
-function renderCatalogItem(item,locations=[],existingItem=null){let root=$('catalogResult');root.replaceChildren();let h=document.createElement('h3');h.textContent=item.found?item.name:'Niet gevonden in openbare catalogi';root.appendChild(h);if(item.image_url&&item.found){let img=document.createElement('img');img.className='product-image';img.src=item.image_url;img.alt=item.name;img.referrerPolicy='no-referrer';root.appendChild(img)}if(item.found){if(item.brand)root.appendChild(Object.assign(document.createElement('p'),{textContent:'Merk/auteur: '+item.brand}));if(item.category)root.appendChild(Object.assign(document.createElement('p'),{textContent:'Categorie: '+item.category}));if(item.quantity)root.appendChild(Object.assign(document.createElement('p'),{textContent:'Inhoud/maat: '+item.quantity}));if(item.description)root.appendChild(Object.assign(document.createElement('p'),{textContent:item.description}));let source=document.createElement('p');source.textContent='Bron: '+(item.source||'openbare database')+(item.cached?' (opgeslagen zoekresultaat)':'');root.appendChild(source);if(item.source_url)addLink(root,'Bekijk bron',item.source_url)}else{let p=document.createElement('p');p.textContent='De barcode is niet gevonden in de openbare productdatabases. Je kunt de winkelzoeklinks hieronder proberen of het artikel handmatig aan je voorraad toevoegen.';root.appendChild(p);if(item.lookup_error){let e=document.createElement('p');e.className='catalog-message';e.textContent='Niet alle online bronnen waren bereikbaar.';root.appendChild(e)}}
-let links=document.createElement('div');links.className='buy-links';let urls=catalogQueryLinks(item);addLink(links,'Google Shopping',urls.google);addLink(links,'Google zoeken',urls.web);addLink(links,'Bol.com',urls.bol);addLink(links,'Amazon.nl',urls.amazon);addLink(links,'Marktplaats',urls.marktplaats);addLink(links,'De Slegte',urls.deslegte);addLink(links,'Bookmatch',urls.bookmatch);addLink(links,'Bruna',urls.bruna);addLink(links,'Discogs (muziek)',urls.discogs);root.appendChild(links);if(item.offers&&item.offers.length){let offersTitle=document.createElement('h4');offersTitle.textContent='Mogelijke aanbieders (via UPCitemdb)';root.appendChild(offersTitle);for(const offer of item.offers){let row=document.createElement('p');let price=offer.price?(' — '+offer.price+(offer.currency?' '+offer.currency:' (valuta onbekend)')):'';let shipping=offer.shipping?(' · verzending '+offer.shipping):'';row.textContent=(offer.merchant||'Winkel')+price+shipping+(offer.availability?' · '+offer.availability:'');root.appendChild(row);if(offer.link)addLink(root,'Bekijk bij '+(offer.merchant||'winkel'),offer.link)}let note=document.createElement('p');note.className='catalog-message';note.textContent='Aanbiedingen kunnen verouderd zijn; controleer prijs en voorraad bij de winkel.';root.appendChild(note)}
+function catalogQueryLinks(item){let q=(item.name?item.name+' ':'')+item.barcode;let encoded=encodeURIComponent(q);let googleSite=site=> 'https://www.google.com/search?q='+encodeURIComponent('site:'+site+' '+q);return {google:'https://www.google.com/search?tbm=shop&q='+encoded,web:'https://www.google.com/search?q='+encoded,bol:'https://www.bol.com/nl/nl/s/?searchtext='+encoded,amazon:'https://www.amazon.nl/s?k='+encoded,marktplaats:'https://www.marktplaats.nl/q/'+encoded+'/',action:googleSite('action.com/nl-nl/p'),lidl:googleSite('lidl.nl/p'),vandijk:googleSite('vandijk.nl'),studystore:googleSite('studystore.nl'),deslegte:googleSite('deslegte.com'),bookmatch:googleSite('bookmatch.nl'),bruna:googleSite('bruna.nl'),discogs:'https://www.discogs.com/search/?q='+encoded+'&type=all'}}
+function renderCatalogItem(item,locations=[],existingItem=null){let root=$('catalogResult');root.replaceChildren();let h=document.createElement('h3');h.textContent=item.found?item.name:'Niet gevonden in openbare catalogi';root.appendChild(h);if(item.image_url&&item.found){let img=document.createElement('img');img.className='product-image';img.src=item.image_url;img.alt=item.name;img.referrerPolicy='no-referrer';root.appendChild(img)}if(item.found){if(item.brand)root.appendChild(Object.assign(document.createElement('p'),{textContent:'Merk/auteur: '+item.brand}));if(item.category)root.appendChild(Object.assign(document.createElement('p'),{textContent:'Categorie: '+item.category}));if(item.quantity)root.appendChild(Object.assign(document.createElement('p'),{textContent:'Inhoud/maat: '+item.quantity}));if(item.description)root.appendChild(Object.assign(document.createElement('p'),{textContent:item.description}));let source=document.createElement('p');source.textContent='Bron: '+(item.source||'openbare database')+(item.cached?' (opgeslagen zoekresultaat)':'');root.appendChild(source);if(item.source_url)addLink(root,'Bekijk bron',item.source_url)}else{let p=document.createElement('p');p.textContent='De barcode is niet gevonden in de openbare productdatabases. Je kunt de winkelzoeklinks hieronder proberen of het artikel handmatig aan je voorraad toevoegen.';root.appendChild(p);if(item.lookup_error){let e=document.createElement('p');e.className='catalog-message';e.textContent='Niet alle online bronnen waren bereikbaar.';root.appendChild(e)}let retry=document.createElement('button');retry.type='button';retry.textContent='Opnieuw zoeken in catalogi';retry.title='Slaat de lokale zoekcache over';retry.onclick=()=>lookupOnline(item.barcode,true);root.appendChild(retry)}
+let links=document.createElement('div');links.className='buy-links';let urls=catalogQueryLinks(item);addLink(links,'Google Shopping',urls.google);addLink(links,'Google zoeken',urls.web);addLink(links,'Bol.com',urls.bol);addLink(links,'Amazon.nl',urls.amazon);addLink(links,'Action',urls.action);addLink(links,'Lidl',urls.lidl);addLink(links,'VanDijk schoolboeken',urls.vandijk);addLink(links,'StudyStore studieboeken',urls.studystore);addLink(links,'Marktplaats',urls.marktplaats);addLink(links,'De Slegte',urls.deslegte);addLink(links,'Bookmatch',urls.bookmatch);addLink(links,'Bruna',urls.bruna);addLink(links,'Discogs (muziek)',urls.discogs);root.appendChild(links);if(item.offers&&item.offers.length){let offersTitle=document.createElement('h4');offersTitle.textContent='Mogelijke aanbieders (via UPCitemdb)';root.appendChild(offersTitle);for(const offer of item.offers){let row=document.createElement('p');let price=offer.price?(' — '+offer.price+(offer.currency?' '+offer.currency:' (valuta onbekend)')):'';let shipping=offer.shipping?(' · verzending '+offer.shipping):'';row.textContent=(offer.merchant||'Winkel')+price+shipping+(offer.availability?' · '+offer.availability:'');root.appendChild(row);if(offer.link)addLink(root,'Bekijk bij '+(offer.merchant||'winkel'),offer.link)}let note=document.createElement('p');note.className='catalog-message';note.textContent='Aanbiedingen kunnen verouderd zijn; controleer prijs en voorraad bij de winkel.';root.appendChild(note)}
 let form=document.createElement(item.found?'dialog':'div');form.className='catalog-form';let prompt=document.createElement('h4');prompt.textContent=item.found?(existingItem?'Dit artikel staat al in je voorraad. Wil je de gegevens wijzigen?':'Product gevonden. Wil je het opslaan in Mijn voorraad?'):'Niet online gevonden. Wil je het zelf aan Mijn voorraad toevoegen?';let nameLabel=document.createElement('label');nameLabel.textContent='Naam (aanpasbaar)';let name=document.createElement('input');name.value=existingItem?.name||item.name||'';name.placeholder='Vul zelf een naam in';let locLabel=document.createElement('label');locLabel.textContent='Welke locatie?';let location=document.createElement('select');let noLocation=document.createElement('option');noLocation.value='';noLocation.textContent='Geen locatie';location.appendChild(noLocation);let locationValues=[...new Set([...(locations||[]),existingItem?.location||''].filter(Boolean))];for(const place of locationValues){let option=document.createElement('option');option.value=place;option.textContent=place;location.appendChild(option)}let newLocationOption=document.createElement('option');newLocationOption.value='__new__';newLocationOption.textContent='Nieuwe locatie invoeren…';location.appendChild(newLocationOption);if(existingItem?.location)location.value=existingItem.location;let customLocation=document.createElement('input');customLocation.placeholder='Typ de nieuwe locatie';customLocation.hidden=true;location.onchange=()=>{customLocation.hidden=location.value!=='__new__';if(!customLocation.hidden)customLocation.focus()};let stockLabel=document.createElement('label');stockLabel.textContent='Aantal op voorraad';let stockCount=document.createElement('input');stockCount.type='number';stockCount.min='0';stockCount.step='1';stockCount.value=existingItem?.stock_count??1;let minLabel=document.createElement('label');minLabel.textContent='Waarschuw bij dit aantal of lager (0 = uit)';let minStock=document.createElement('input');minStock.type='number';minStock.min='0';minStock.step='1';minStock.value=existingItem?.min_stock??0;let noteLabel=document.createElement('label');noteLabel.textContent='Notities';let notes=document.createElement('textarea');notes.value=existingItem?.notes||[item.source?'Bron: '+item.source:'',item.brand,item.category,item.quantity,item.description].filter(Boolean).join(' · ');let buttons=document.createElement('div');buttons.className='buttons';let save=document.createElement('button');save.className='primary';save.textContent=existingItem?'Opslaan van wijzigingen':item.found?'Ja, opslaan in Mijn voorraad':'Handmatig toevoegen';let skip=document.createElement('button');skip.textContent='Nee, niet opslaan';let msg=document.createElement('p');msg.className='catalog-message';save.onclick=async()=>{if(!name.value.trim()){msg.textContent='Vul eerst een naam in.';return}let chosenLocation=location.value==='__new__'?customLocation.value.trim():location.value;if(location.value==='__new__'&&!chosenLocation){msg.textContent='Typ een locatie of kies “Geen locatie”.';return}try{let response=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:existingItem?.id||null,barcode:item.barcode,name:name.value.trim(),location:chosenLocation,stock_count:stockCount.value,min_stock:minStock.value,notes:notes.value.trim()})});let data=await response.json();if(!response.ok)throw Error(data.error||'Opslaan mislukt');if(form instanceof HTMLDialogElement&&form.open)form.close();setTab('inventory');$('lastScan').textContent=data.item.barcode;fillForm(data.item);setMessage('Opgeslagen vanuit de algemene database.');loadInventoryList()}catch(e){msg.textContent=e.message}};skip.onclick=()=>{if(item.found){form.close();let notice=document.createElement('p');notice.className='catalog-message';notice.textContent='Niet opgeslagen in Mijn voorraad; het resultaat blijft alleen in de online zoekgeschiedenis.';root.insertBefore(notice,root.firstChild)}else{msg.textContent='Niet toegevoegd aan Mijn voorraad.'}};form.append(prompt,nameLabel,name,locLabel,location,customLocation,stockLabel,stockCount,minLabel,minStock,noteLabel,notes,buttons,msg);buttons.append(save,skip);root.appendChild(form);if(item.found)form.showModal()}
-async function lookupOnline(code){code=(code||'').trim();if(!code)return;$('catalogBarcode').value=code;$('catalogResult').textContent='Zoeken in openbare databases…';setTab('catalog');try{let response=await fetch('/api/lookup?barcode='+encodeURIComponent(code));let data=await response.json();if(!response.ok)throw Error(data.error||'Zoeken mislukt');renderCatalogItem(data.item,data.locations||[],data.existing_item||null);loadCatalogRecent()}catch(e){$('catalogResult').textContent='Online zoeken mislukt: '+e.message}}
+async function lookupOnline(code,force=false){code=(code||'').trim();if(!code)return;$('catalogBarcode').value=code;$('catalogResult').textContent='Zoeken in openbare databases…';setTab('catalog');try{let url='/api/lookup?barcode='+encodeURIComponent(code)+(force?'&refresh=1':'');let response=await fetch(url);let data=await response.json();if(!response.ok)throw Error(data.error||'Zoeken mislukt');renderCatalogItem(data.item,data.locations||[],data.existing_item||null);loadCatalogRecent()}catch(e){$('catalogResult').textContent='Online zoeken mislukt: '+e.message}}
 $('catalogLookup').onclick=()=>lookupOnline($('catalogBarcode').value);$('catalogBarcode').addEventListener('keydown',e=>{if(e.key==='Enter')lookupOnline($('catalogBarcode').value)});
 function renderRecentCatalog(items){let root=$('catalogRecent');root.replaceChildren();if(!items.length){root.innerHTML='<div class="empty">Nog geen online zoekopdrachten.</div>';return}for(const item of items){let b=document.createElement('button');b.className='recent-row';b.textContent=(item.name||'Onbekend product')+' · '+item.barcode;b.onclick=async()=>{setTab('catalog');$('catalogBarcode').value=item.barcode;try{let [loc,stock]=await Promise.all([fetch('/api/locations').then(r=>r.json()),fetch('/api/by-barcode?code='+encodeURIComponent(item.barcode)).then(r=>r.json())]);renderCatalogItem(item,loc.locations||[],stock.item||null)}catch(e){renderCatalogItem(item)}};root.appendChild(b)}}
 async function loadCatalogRecent(){try{let q=$('catalogSearch').value.trim();let url=q?'/api/catalog/search?q='+encodeURIComponent(q):'/api/catalog/recent';let d=await(await fetch(url)).json();renderRecentCatalog(d.items||[])}catch(e){}}
