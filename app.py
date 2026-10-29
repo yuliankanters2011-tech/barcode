@@ -333,12 +333,26 @@ def init_db():
             source TEXT NOT NULL DEFAULT '',
             source_url TEXT NOT NULL DEFAULT '',
             description TEXT NOT NULL DEFAULT '',
+            offers_json TEXT NOT NULL DEFAULT '[]',
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )""")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(catalog_cache)")}
+        if "offers_json" not in columns:
+            conn.execute("ALTER TABLE catalog_cache ADD COLUMN offers_json TEXT NOT NULL DEFAULT '[]'")
 
 
 def row_to_dict(row):
     return dict(row) if row is not None else None
+
+
+def catalog_row_to_dict(row):
+    item = row_to_dict(row)
+    if item is not None:
+        try:
+            item["offers"] = json.loads(item.pop("offers_json", "[]") or "[]")
+        except (ValueError, TypeError):
+            item["offers"] = []
+    return item
 
 
 def get_item_by_barcode(code):
@@ -357,6 +371,10 @@ def catalog_from_cache(barcode, max_age_hours=24):
         stamp = datetime.strptime(item["updated_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         if (datetime.now(timezone.utc) - stamp).total_seconds() <= max_age_hours * 3600:
             item["cached"] = True
+            try:
+                item["offers"] = json.loads(item.pop("offers_json", "[]") or "[]")
+            except (ValueError, TypeError):
+                item["offers"] = []
             return item
     except (ValueError, TypeError):
         pass
@@ -366,15 +384,17 @@ def catalog_from_cache(barcode, max_age_hours=24):
 def save_catalog_result(item):
     with DB_LOCK, db_session() as conn:
         conn.execute("""INSERT INTO catalog_cache
-            (barcode, found, name, brand, category, quantity, image_url, source, source_url, description)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
+            (barcode, found, name, brand, category, quantity, image_url, source, source_url, description, offers_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(barcode) DO UPDATE SET found=excluded.found, name=excluded.name,
             brand=excluded.brand, category=excluded.category, quantity=excluded.quantity,
             image_url=excluded.image_url, source=excluded.source, source_url=excluded.source_url,
-            description=excluded.description, updated_at=CURRENT_TIMESTAMP""",
+            description=excluded.description, offers_json=excluded.offers_json,
+            updated_at=CURRENT_TIMESTAMP""",
             (item["barcode"], int(item["found"]), item.get("name", ""), item.get("brand", ""),
              item.get("category", ""), item.get("quantity", ""), item.get("image_url", ""),
-             item.get("source", ""), item.get("source_url", ""), item.get("description", "")))
+             item.get("source", ""), item.get("source_url", ""), item.get("description", ""),
+             json.dumps(item.get("offers", []), ensure_ascii=False)))
 
 
 def fetch_fact_product(base, barcode, source_name):
@@ -401,12 +421,59 @@ def fetch_fact_product(base, barcode, source_name):
     }
 
 
+def fetch_upcitemdb(barcode):
+    # Free Explorer API: no key required, with a published daily request limit.
+    url = "https://api.upcitemdb.com/prod/trial/lookup?" + urlencode({"upc": barcode})
+    request = Request(url, headers={"Accept": "application/json",
+                                    "User-Agent": "ScanBase/1.3 barcode inventory"})
+    with urlopen(request, timeout=6) as response:
+        payload = json.loads(response.read(1_000_000).decode("utf-8"))
+    products = payload.get("items") or []
+    if not products:
+        return None
+    product = products[0]
+    title = (product.get("title") or "").strip()
+    if not title:
+        return None
+    offers = []
+    for offer in product.get("offers", [])[:8]:
+        if not offer.get("link"):
+            continue
+        offers.append({
+            "merchant": offer.get("merchant") or offer.get("domain") or "Winkel",
+            "price": offer.get("price", ""),
+            "currency": offer.get("currency", ""),
+            "shipping": offer.get("shipping", ""),
+            "availability": offer.get("availability", ""),
+            "link": offer.get("link", ""),
+            "updated_t": offer.get("updated_t", ""),
+        })
+    images = product.get("images") or []
+    return {
+        "barcode": barcode, "found": True, "name": title,
+        "brand": product.get("brand", ""), "category": product.get("category", ""),
+        "quantity": product.get("size") or product.get("dimension", ""),
+        "image_url": images[0] if images else "", "source": "UPCitemdb",
+        "source_url": f"https://www.upcitemdb.com/upc/{quote(barcode, safe='')}",
+        "description": product.get("description", ""), "offers": offers,
+    }
+
+
 def lookup_online(barcode, use_cache=True):
     barcode = str(barcode).strip()
     if use_cache:
         cached = catalog_from_cache(barcode)
         if cached is not None:
             return cached
+
+    errors = []
+    try:
+        item = fetch_upcitemdb(barcode)
+        if item:
+            save_catalog_result(item)
+            return item
+    except Exception as exc:
+        errors.append(f"UPCitemdb: {type(exc).__name__}")
 
     # Try specialist open barcode catalogues; not every barcode is indexed.
     sources = [
@@ -415,7 +482,6 @@ def lookup_online(barcode, use_cache=True):
         ("Open Beauty Facts", "https://world.openbeautyfacts.org"),
         ("Open Pet Food Facts", "https://world.openpetfoodfacts.org"),
     ]
-    errors = []
     for source_name, base in sources:
         try:
             item = fetch_fact_product(base, barcode, source_name)
@@ -455,16 +521,16 @@ def lookup_online(barcode, use_cache=True):
 
 def recent_catalog_items(limit=50):
     with DB_LOCK, db_session() as conn:
-        rows = conn.execute("SELECT * FROM catalog_cache ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
-    return [row_to_dict(row) for row in rows]
+        rows = conn.execute("SELECT * FROM catalog_cache ORDER BY updated_at DESC, rowid DESC LIMIT ?", (limit,)).fetchall()
+    return [catalog_row_to_dict(row) for row in rows]
 
 
 def search_catalog_cache(query, limit=50):
     like = f"%{query}%"
     with DB_LOCK, db_session() as conn:
         rows = conn.execute("""SELECT * FROM catalog_cache WHERE barcode LIKE ? OR name LIKE ? OR brand LIKE ? OR category LIKE ?
-            ORDER BY updated_at DESC LIMIT ?""", (like, like, like, like, limit)).fetchall()
-    return [row_to_dict(row) for row in rows]
+            ORDER BY updated_at DESC, rowid DESC LIMIT ?""", (like, like, like, like, limit)).fetchall()
+    return [catalog_row_to_dict(row) for row in rows]
 
 
 def json_bytes(value):
@@ -655,7 +721,7 @@ $('delete').onclick=async()=>{if(!confirm('Dit artikel verwijderen?'))return;try
 function addLink(container,label,url){let a=document.createElement('a');a.textContent=label;a.href=url;a.target='_blank';a.rel='noopener noreferrer';container.appendChild(a)}
 function catalogQueryLinks(item){let q=(item.name?item.name+' ':'')+item.barcode;let encoded=encodeURIComponent(q);return {google:'https://www.google.com/search?tbm=shop&q='+encoded,web:'https://www.google.com/search?q='+encoded,bol:'https://www.bol.com/nl/nl/s/?searchtext='+encoded,amazon:'https://www.amazon.nl/s?k='+encoded}}
 function renderCatalogItem(item){let root=$('catalogResult');root.replaceChildren();let h=document.createElement('h3');h.textContent=item.found?item.name:'Niet gevonden in openbare catalogi';root.appendChild(h);if(item.image_url&&item.found){let img=document.createElement('img');img.className='product-image';img.src=item.image_url;img.alt=item.name;img.referrerPolicy='no-referrer';root.appendChild(img)}if(item.found){if(item.brand)root.appendChild(Object.assign(document.createElement('p'),{textContent:'Merk/auteur: '+item.brand}));if(item.category)root.appendChild(Object.assign(document.createElement('p'),{textContent:'Categorie: '+item.category}));if(item.quantity)root.appendChild(Object.assign(document.createElement('p'),{textContent:'Inhoud/maat: '+item.quantity}));if(item.description)root.appendChild(Object.assign(document.createElement('p'),{textContent:item.description}));let source=document.createElement('p');source.textContent='Bron: '+(item.source||'openbare database')+(item.cached?' (opgeslagen zoekresultaat)':'');root.appendChild(source);if(item.source_url)addLink(root,'Bekijk bron',item.source_url)}else{let p=document.createElement('p');p.textContent='De barcode is niet gevonden in de openbare productdatabases. Je kunt de winkelzoeklinks hieronder proberen of het artikel handmatig aan je voorraad toevoegen.';root.appendChild(p);if(item.lookup_error){let e=document.createElement('p');e.className='catalog-message';e.textContent='Niet alle online bronnen waren bereikbaar.';root.appendChild(e)}}
-let links=document.createElement('div');links.className='buy-links';let urls=catalogQueryLinks(item);addLink(links,'Google Shopping',urls.google);addLink(links,'Google zoeken',urls.web);addLink(links,'Bol.com',urls.bol);addLink(links,'Amazon.nl',urls.amazon);root.appendChild(links);
+let links=document.createElement('div');links.className='buy-links';let urls=catalogQueryLinks(item);addLink(links,'Google Shopping',urls.google);addLink(links,'Google zoeken',urls.web);addLink(links,'Bol.com',urls.bol);addLink(links,'Amazon.nl',urls.amazon);root.appendChild(links);if(item.offers&&item.offers.length){let offersTitle=document.createElement('h4');offersTitle.textContent='Mogelijke aanbieders (via UPCitemdb)';root.appendChild(offersTitle);for(const offer of item.offers){let row=document.createElement('p');let price=offer.price?(' — '+offer.price+(offer.currency?' '+offer.currency:' (valuta onbekend)')):'';let shipping=offer.shipping?(' · verzending '+offer.shipping):'';row.textContent=(offer.merchant||'Winkel')+price+shipping+(offer.availability?' · '+offer.availability:'');root.appendChild(row);if(offer.link)addLink(root,'Bekijk bij '+(offer.merchant||'winkel'),offer.link)}let note=document.createElement('p');note.className='catalog-message';note.textContent='Aanbiedingen kunnen verouderd zijn; controleer prijs en voorraad bij de winkel.';root.appendChild(note)}
 let form=document.createElement('div');form.className='catalog-form';let nameLabel=document.createElement('label');nameLabel.textContent='Naam voor mijn voorraad (aanpasbaar)';let name=document.createElement('input');name.value=item.name||'';name.placeholder='Vul zelf een naam in als online niets is gevonden';let locLabel=document.createElement('label');locLabel.textContent='Locatie in mijn voorraad';let location=document.createElement('input');location.placeholder='Bijvoorbeeld: kast A2';let noteLabel=document.createElement('label');noteLabel.textContent='Notities';let notes=document.createElement('textarea');notes.value=[item.brand,item.category,item.quantity,item.description].filter(Boolean).join(' · ');let save=document.createElement('button');save.className='primary';save.textContent='Opslaan in mijn voorraad';let msg=document.createElement('p');msg.className='catalog-message';save.onclick=async()=>{if(!name.value.trim()){msg.textContent='Vul eerst een naam in.';return}try{let response=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({barcode:item.barcode,name:name.value.trim(),location:location.value.trim(),notes:notes.value.trim()})});let data=await response.json();if(!response.ok)throw Error(data.error||'Opslaan mislukt');setTab('inventory');$('lastScan').textContent=data.item.barcode;fillForm(data.item);setMessage('Opgeslagen vanuit de algemene database.')}catch(e){msg.textContent=e.message}};form.append(nameLabel,name,locLabel,location,noteLabel,notes,save,msg);root.appendChild(form)}
 async function lookupOnline(code){code=(code||'').trim();if(!code)return;$('catalogBarcode').value=code;$('catalogResult').textContent='Zoeken in openbare databases…';setTab('catalog');try{let response=await fetch('/api/lookup?barcode='+encodeURIComponent(code));let data=await response.json();if(!response.ok)throw Error(data.error||'Zoeken mislukt');renderCatalogItem(data.item);loadCatalogRecent()}catch(e){$('catalogResult').textContent='Online zoeken mislukt: '+e.message}}
 $('catalogLookup').onclick=()=>lookupOnline($('catalogBarcode').value);$('catalogBarcode').addEventListener('keydown',e=>{if(e.key==='Enter')lookupOnline($('catalogBarcode').value)});
