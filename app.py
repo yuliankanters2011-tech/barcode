@@ -18,7 +18,8 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 DB_PATH = os.environ.get("DB_PATH", "/data/scanbase.db")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -321,6 +322,19 @@ def init_db():
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_items_name ON items(name)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS catalog_cache (
+            barcode TEXT PRIMARY KEY,
+            found INTEGER NOT NULL DEFAULT 0,
+            name TEXT NOT NULL DEFAULT '',
+            brand TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT '',
+            quantity TEXT NOT NULL DEFAULT '',
+            image_url TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            source_url TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
 
 
 def row_to_dict(row):
@@ -331,6 +345,126 @@ def get_item_by_barcode(code):
     with DB_LOCK, db_session() as conn:
         row = conn.execute("SELECT * FROM items WHERE barcode=?", (code,)).fetchone()
         return row_to_dict(row)
+
+
+def catalog_from_cache(barcode, max_age_hours=24):
+    with DB_LOCK, db_session() as conn:
+        row = conn.execute("SELECT * FROM catalog_cache WHERE barcode=?", (barcode,)).fetchone()
+    if row is None:
+        return None
+    item = row_to_dict(row)
+    try:
+        stamp = datetime.strptime(item["updated_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - stamp).total_seconds() <= max_age_hours * 3600:
+            item["cached"] = True
+            return item
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def save_catalog_result(item):
+    with DB_LOCK, db_session() as conn:
+        conn.execute("""INSERT INTO catalog_cache
+            (barcode, found, name, brand, category, quantity, image_url, source, source_url, description)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(barcode) DO UPDATE SET found=excluded.found, name=excluded.name,
+            brand=excluded.brand, category=excluded.category, quantity=excluded.quantity,
+            image_url=excluded.image_url, source=excluded.source, source_url=excluded.source_url,
+            description=excluded.description, updated_at=CURRENT_TIMESTAMP""",
+            (item["barcode"], int(item["found"]), item.get("name", ""), item.get("brand", ""),
+             item.get("category", ""), item.get("quantity", ""), item.get("image_url", ""),
+             item.get("source", ""), item.get("source_url", ""), item.get("description", "")))
+
+
+def fetch_fact_product(base, barcode, source_name):
+    fields = "code,product_name,product_name_en,generic_name,brands,categories,quantity,image_url,image_front_url,url"
+    url = f"{base}/api/v2/product/{quote(barcode, safe='')}.json?{urlencode({'fields': fields})}"
+    request = Request(url, headers={"User-Agent": "ScanBase/1.2 (barcode inventory; read-only lookup)"})
+    with urlopen(request, timeout=5) as response:
+        payload = json.loads(response.read(1_000_000).decode("utf-8"))
+    if payload.get("status") != 1:
+        return None
+    product = payload.get("product") or {}
+    name = (product.get("product_name") or product.get("product_name_en") or
+            product.get("generic_name") or "").strip()
+    if not name:
+        return None
+    return {
+        "barcode": barcode, "found": True, "name": name,
+        "brand": product.get("brands", ""), "category": product.get("categories", ""),
+        "quantity": product.get("quantity", ""),
+        "image_url": product.get("image_url") or product.get("image_front_url", ""),
+        "source": source_name,
+        "source_url": product.get("url") or f"{base}/product/{quote(barcode, safe='')}",
+        "description": product.get("generic_name", ""),
+    }
+
+
+def lookup_online(barcode, use_cache=True):
+    barcode = str(barcode).strip()
+    if use_cache:
+        cached = catalog_from_cache(barcode)
+        if cached is not None:
+            return cached
+
+    # Try specialist open barcode catalogues; not every barcode is indexed.
+    sources = [
+        ("Open Food Facts", "https://world.openfoodfacts.org"),
+        ("Open Products Facts", "https://world.openproductsfacts.org"),
+        ("Open Beauty Facts", "https://world.openbeautyfacts.org"),
+        ("Open Pet Food Facts", "https://world.openpetfoodfacts.org"),
+    ]
+    errors = []
+    for source_name, base in sources:
+        try:
+            item = fetch_fact_product(base, barcode, source_name)
+            if item:
+                save_catalog_result(item)
+                return item
+        except Exception as exc:
+            errors.append(f"{source_name}: {type(exc).__name__}")
+
+    # ISBN barcodes can also be found in Open Library.
+    if len(barcode) in (10, 13) and (barcode.startswith("978") or barcode.startswith("979") or len(barcode) == 10):
+        try:
+            url = "https://openlibrary.org/api/books?" + urlencode({
+                "bibkeys": "ISBN:" + barcode, "format": "json", "jscmd": "data"})
+            request = Request(url, headers={"User-Agent": "ScanBase/1.2 (barcode inventory; read-only lookup)"})
+            with urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read(1_000_000).decode("utf-8"))
+            book = payload.get("ISBN:" + barcode)
+            if book and book.get("title"):
+                authors = ", ".join(a.get("name", "") for a in book.get("authors", []) if a.get("name"))
+                item = {"barcode": barcode, "found": True, "name": book["title"],
+                        "brand": authors, "category": "Boek", "quantity": "",
+                        "image_url": (book.get("cover") or {}).get("medium", ""),
+                        "source": "Open Library", "source_url": f"https://openlibrary.org/isbn/{quote(barcode, safe='')}",
+                        "description": book.get("publish_date", "")}
+                save_catalog_result(item)
+                return item
+        except Exception as exc:
+            errors.append(f"Open Library: {type(exc).__name__}")
+
+    item = {"barcode": barcode, "found": False, "name": "", "brand": "", "category": "",
+            "quantity": "", "image_url": "", "source": "", "source_url": "",
+            "description": "", "lookup_error": "; ".join(errors)}
+    save_catalog_result(item)
+    return item
+
+
+def recent_catalog_items(limit=50):
+    with DB_LOCK, db_session() as conn:
+        rows = conn.execute("SELECT * FROM catalog_cache ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def search_catalog_cache(query, limit=50):
+    like = f"%{query}%"
+    with DB_LOCK, db_session() as conn:
+        rows = conn.execute("""SELECT * FROM catalog_cache WHERE barcode LIKE ? OR name LIKE ? OR brand LIKE ? OR category LIKE ?
+            ORDER BY updated_at DESC LIMIT ?""", (like, like, like, like, limit)).fetchall()
+    return [row_to_dict(row) for row in rows]
 
 
 def json_bytes(value):
@@ -413,6 +547,23 @@ class Handler(BaseHTTPRequestHandler):
             code = params.get("code", [""])[0]
             self.send_json({"item": get_item_by_barcode(code)})
             return
+        if parsed.path == "/api/lookup":
+            code = params.get("barcode", [""])[0].strip()
+            if not code or len(code) > 64:
+                self.send_json({"error": "Voer een geldige barcode in"}, 400)
+                return
+            self.send_json({"item": lookup_online(code)})
+            return
+        if parsed.path == "/api/catalog/recent":
+            self.send_json({"items": recent_catalog_items()})
+            return
+        if parsed.path == "/api/catalog/search":
+            query = params.get("q", [""])[0].strip()
+            if not query:
+                self.send_json({"items": recent_catalog_items()})
+            else:
+                self.send_json({"items": search_catalog_cache(query)})
+            return
         self.send_json({"error": "Niet gevonden"}, 404)
 
     def do_POST(self):
@@ -476,26 +627,42 @@ PAGE = r'''<!doctype html>
 <html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ScanBase — voorraad</title><style>
 :root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#eaf0ff;background:#0b1020;--panel:#151d33;--line:#283451;--muted:#a4b0ca;--accent:#73e0c1;--blue:#6da8ff}
-*{box-sizing:border-box}body{margin:0}header{padding:22px max(20px,calc((100% - 1100px)/2));display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);background:#10172a;gap:14px}h1{font-size:22px;margin:0}header p{margin:4px 0 0;color:var(--muted);font-size:13px}.status{font-size:13px;padding:8px 12px;border:1px solid var(--line);border-radius:999px;color:var(--muted)}.status.ready{color:var(--accent);border-color:#286956}.status.error{color:#ff9292;border-color:#8c3b46}
-main{max-width:1100px;margin:24px auto;padding:0 18px;display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;box-shadow:0 10px 30px #0002}.card h2{font-size:17px;margin:0 0 16px}.wide{grid-column:1/-1}.scanbox{padding:14px;border-radius:12px;background:#0f1830;border:1px solid #273858;margin-bottom:18px}.scanbox small{color:var(--muted)}#lastScan{font-size:23px;font-weight:700;margin-top:4px;word-break:break-all;color:var(--accent)}label{display:block;font-size:13px;color:var(--muted);margin:13px 0 6px}input,textarea{font:inherit;width:100%;padding:11px 12px;border-radius:9px;border:1px solid #364461;background:#0e1527;color:#f5f7ff;outline:none}input:focus,textarea:focus{border-color:var(--blue);box-shadow:0 0 0 3px #6da8ff22}textarea{min-height:85px;resize:vertical}.buttons{display:flex;gap:9px;flex-wrap:wrap;margin-top:16px}button{font:inherit;border:0;border-radius:9px;padding:10px 14px;cursor:pointer;background:#283653;color:#edf3ff}button.primary{background:#69d8b6;color:#071b18;font-weight:700}button.danger{background:#492632;color:#ffb5b5}button:hover{filter:brightness(1.12)}.results{display:grid;gap:8px;margin-top:12px}.result{width:100%;text-align:left;padding:12px;border:1px solid var(--line);background:#111a2e}.result strong{display:block}.result span{display:block;color:var(--muted);font-size:13px;margin-top:3px}.hint,#message{color:var(--muted);font-size:13px}.empty{padding:14px;color:var(--muted);font-size:14px}.footer{max-width:1100px;margin:0 auto 25px;padding:0 18px;color:#7e8ba8;font-size:12px}@media(max-width:760px){main{grid-template-columns:1fr}.wide{grid-column:auto}header{align-items:flex-start;flex-direction:column}}
+*{box-sizing:border-box}body{margin:0}header{padding:22px max(20px,calc((100% - 1100px)/2));display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);background:#10172a;gap:14px}h1{font-size:22px;margin:0}header p{margin:4px 0 0;color:var(--muted);font-size:13px}.status{font-size:13px;padding:8px 12px;border:1px solid var(--line);border-radius:999px;color:var(--muted)}.status.ready{color:var(--accent);border-color:#286956}.status.error{color:#ff9292;border-color:#8c3b46}.tabbar{max-width:1100px;margin:18px auto 0;padding:0 18px;display:flex;gap:10px}.tabbutton{background:transparent;border:1px solid var(--line);color:var(--muted)}.tabbutton.active{background:#203653;color:var(--accent);border-color:#3b6e7f}.catalog-grid{max-width:1100px;margin:24px auto;padding:0 18px;display:grid;grid-template-columns:1fr 1fr;gap:18px}.searchrow{display:flex;gap:10px}.searchrow input{flex:1}.catalog-result{margin-top:16px;padding:16px;border:1px solid var(--line);border-radius:12px;background:#101a30}.catalog-result h3{margin:0 0 8px;font-size:20px}.catalog-result p{color:var(--muted);margin:6px 0}.product-image{max-width:140px;max-height:140px;object-fit:contain;float:right;margin:0 0 10px 14px;border-radius:8px}.buy-links{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.buy-links a{display:inline-block;padding:8px 11px;background:#263653;border-radius:8px;color:#cfe3ff;text-decoration:none}.recent-row{width:100%;text-align:left;padding:11px;border:1px solid var(--line);background:#111a2e;border-radius:9px;color:#edf3ff;margin:5px 0}.catalog-form{border-top:1px solid var(--line);margin-top:15px;padding-top:12px}.catalog-message{color:var(--muted);font-size:13px;margin-top:8px}@media(max-width:760px){.catalog-grid{grid-template-columns:1fr}.searchrow{flex-direction:column}}
+main{max-width:1100px;margin:24px auto;padding:0 18px;display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;box-shadow:0 10px 30px #0002}.card h2{font-size:17px;margin:0 0 16px}.wide{grid-column:1/-1}.scanbox{padding:14px;border-radius:12px;background:#0f1830;border:1px solid #273858;margin-bottom:12px}.scanbox small{color:var(--muted)}#lastScan{font-size:23px;font-weight:700;margin-top:4px;word-break:break-all;color:var(--accent)}.scan-details{padding:13px 14px;border:1px solid var(--line);border-radius:12px;background:#111a2e;min-height:68px}.scan-details strong{display:block;font-size:18px}.scan-details span{display:block;color:var(--muted);margin-top:5px}.scan-details.empty{color:var(--muted)}label{display:block;font-size:13px;color:var(--muted);margin:13px 0 6px}input,textarea{font:inherit;width:100%;padding:11px 12px;border-radius:9px;border:1px solid #364461;background:#0e1527;color:#f5f7ff;outline:none}input:focus,textarea:focus{border-color:var(--blue);box-shadow:0 0 0 3px #6da8ff22}textarea{min-height:85px;resize:vertical}.buttons{display:flex;gap:9px;flex-wrap:wrap;margin-top:16px}button{font:inherit;border:0;border-radius:9px;padding:10px 14px;cursor:pointer;background:#283653;color:#edf3ff}button.primary{background:#69d8b6;color:#071b18;font-weight:700}button.danger{background:#492632;color:#ffb5b5}button:hover{filter:brightness(1.12)}.results{display:grid;gap:8px;margin-top:12px}.result{width:100%;text-align:left;padding:12px;border:1px solid var(--line);background:#111a2e}.result strong{display:block}.result span{display:block;color:var(--muted);font-size:13px;margin-top:3px}.hint,#message{color:var(--muted);font-size:13px}.empty{padding:14px;color:var(--muted);font-size:14px}.footer{max-width:1100px;margin:0 auto 25px;padding:0 18px;color:#7e8ba8;font-size:12px}@media(max-width:760px){main{grid-template-columns:1fr}.wide{grid-column:auto}header{align-items:flex-start;flex-direction:column}}
 </style></head><body>
 <header><div><h1>ScanBase</h1><p>Voorraad, barcodes en locaties</p></div><div id="status" class="status">Scanner verbinden…</div></header>
-<main><section class="card"><h2>Scanner</h2><div class="scanbox"><small>Laatste scan</small><div id="lastScan">Nog niets gescand</div></div><p class="hint">Scan een artikel. Bekende artikelen worden geopend; onbekende codes kun je toevoegen.</p></section>
+<nav class="tabbar"><button id="tabInventory" class="tabbutton active" type="button">Mijn voorraad</button><button id="tabCatalog" class="tabbutton" type="button">Algemene database</button></nav>
+<main id="inventoryView"><section class="card"><h2>Scanner</h2><div class="scanbox"><small>Laatste scan</small><div id="lastScan">Nog niets gescand</div></div><div id="scanDetails" class="scan-details empty">Na een scan zie je hier de naam en locatie.</div><p class="hint">Bekende artikelen worden getoond; onbekende codes kun je hieronder toevoegen.</p></section>
 <section class="card"><h2>Zoeken</h2><label for="search">Zoek op naam, barcode, locatie of notitie</label><input id="search" autocomplete="off" placeholder="Bijvoorbeeld: boormachine of kast A2"><div id="results" class="results"><div class="empty">Typ om artikelen te zoeken.</div></div></section>
-<section class="card wide"><h2 id="formTitle">Artikel toevoegen of wijzigen</h2><input type="hidden" id="itemId"><label for="barcode">Barcode</label><input id="barcode" autocomplete="off" placeholder="Scan of typ een barcode"><label for="name">Naam</label><input id="name" autocomplete="off" placeholder="Bijvoorbeeld: accuboormachine"><label for="location">Locatie</label><input id="location" autocomplete="off" placeholder="Bijvoorbeeld: schuur, kast A2"><label for="notes">Notities</label><textarea id="notes" placeholder="Extra informatie (optioneel)"></textarea><div class="buttons"><button class="primary" id="save">Opslaan</button><button id="clear">Leegmaken</button><button class="danger" id="delete" hidden>Verwijderen</button></div><p id="message" role="status"></p></section></main><div class="footer">De database staat lokaal op de NAS. Houd deze pagina alleen beschikbaar op je eigen netwerk.</div>
+<section class="card wide"><h2 id="formTitle">Artikel toevoegen of wijzigen</h2><input type="hidden" id="itemId"><label for="barcode">Barcode</label><input id="barcode" autocomplete="off" placeholder="Scan of typ een barcode"><label for="name">Naam</label><input id="name" autocomplete="off" placeholder="Bijvoorbeeld: accuboormachine"><label for="location">Locatie</label><input id="location" autocomplete="off" placeholder="Bijvoorbeeld: schuur, kast A2"><label for="notes">Notities</label><textarea id="notes" placeholder="Extra informatie (optioneel)"></textarea><div class="buttons"><button class="primary" id="save">Opslaan</button><button id="clear">Leegmaken</button><button class="danger" id="delete" hidden>Verwijderen</button></div><p id="message" role="status"></p></section></main>
+<main id="catalogView" class="catalog-grid" hidden><section class="card"><h2>Algemene productdatabase</h2><p class="hint">Zoek een barcode in openbare productdatabases. De dekking verschilt per productsoort.</p><label for="catalogBarcode">Barcode</label><div class="searchrow"><input id="catalogBarcode" autocomplete="off" placeholder="Scan of typ EAN/UPC/ISBN"><button class="primary" id="catalogLookup" type="button">Zoek online</button></div><div id="catalogResult" class="catalog-result"><p>Voer een barcode in of scan een onbekend artikel.</p></div></section><section class="card"><h2>Recent online opgezocht</h2><label for="catalogSearch">Zoek in je online zoekgeschiedenis</label><input id="catalogSearch" autocomplete="off" placeholder="Naam, merk of barcode"><div id="catalogRecent" class="results"><div class="empty">Nog geen online zoekopdrachten.</div></div><p class="hint">Dit is de lokale geschiedenis van opgezochte codes, niet een volledige kopie van internet.</p></section></main>
+<div class="footer">Persoonlijke voorraad blijft apart van online productinformatie. Online resultaten komen uit openbare databases; winkelknoppen openen zoekpagina's.</div>
 <script>
-const $=id=>document.getElementById(id);let lastId=0;let searchTimer;
+const $=id=>document.getElementById(id);let lastId=0;let searchTimer;let catalogTimer;
 function setMessage(t){$('message').textContent=t||''}
+function setTab(name){const inventory=name==='inventory';$('inventoryView').hidden=!inventory;$('catalogView').hidden=inventory;$('tabInventory').classList.toggle('active',inventory);$('tabCatalog').classList.toggle('active',!inventory);if(!inventory)loadCatalogRecent()}
+function showScanDetails(item,code=''){const root=$('scanDetails');root.replaceChildren();if(item){root.className='scan-details';const title=document.createElement('strong');title.textContent=item.name||'Naam ontbreekt';const location=document.createElement('span');location.textContent='Locatie: '+(item.location||'Nog geen locatie ingevuld');root.append(title,location);return}root.className='scan-details empty';const title=document.createElement('strong');title.textContent=code?'Nog niet opgeslagen':'Na een scan zie je hier de naam en locatie.';const detail=document.createElement('span');detail.textContent=code?'Barcode: '+code:'';root.append(title,detail)}
 function clearForm(){ $('itemId').value='';$('barcode').value='';$('name').value='';$('location').value='';$('notes').value='';$('formTitle').textContent='Artikel toevoegen of wijzigen';$('delete').hidden=true;setMessage('') }
-function fillForm(item){$('itemId').value=item?.id||'';$('barcode').value=item?.barcode||'';$('name').value=item?.name||'';$('location').value=item?.location||'';$('notes').value=item?.notes||'';$('formTitle').textContent=item?'Artikel wijzigen':'Nieuw artikel';$('delete').hidden=!item;setMessage(item?'Artikel geladen.':'Onbekende barcode — vul een naam en locatie in.')}
-async function loadByBarcode(code){$('lastScan').textContent=code;try{let r=await fetch('/api/by-barcode?code='+encodeURIComponent(code));let d=await r.json();fillForm(d.item||{barcode:code})}catch(e){setMessage('Kon artikel niet laden: '+e.message)}}
+function fillForm(item){$('itemId').value=item?.id||'';$('barcode').value=item?.barcode||'';$('name').value=item?.name||'';$('location').value=item?.location||'';$('notes').value=item?.notes||'';$('formTitle').textContent=item?.id?'Artikel wijzigen':'Nieuw artikel';$('delete').hidden=!item?.id;setMessage(item?.id?'Artikel geladen.':'Onbekende barcode — vul een naam en locatie in.');showScanDetails(item?.id?item:null,item?.barcode||'')}
+async function loadByBarcode(code){$('lastScan').textContent=code;try{let r=await fetch('/api/by-barcode?code='+encodeURIComponent(code));let d=await r.json();if(d.item){setTab('inventory');fillForm(d.item)}else{setTab('catalog');$('catalogBarcode').value=code;fillForm({barcode:code});await lookupOnline(code)}}catch(e){setTab('inventory');fillForm({barcode:code});setMessage('Kon artikel niet laden: '+e.message)}}
 async function pollScans(){try{let d=await (await fetch('/api/scans?after='+lastId)).json();for(const s of d.scans){lastId=s.id;await loadByBarcode(s.code)}}catch(e){}setTimeout(pollScans,500)}
 async function refreshStatus(){try{let d=await (await fetch('/api/status')).json(),s=d.scanner;$('status').textContent=s.message;$('status').className='status '+(s.state==='ready'?'ready':s.state==='error'?'error':'')}catch(e){$('status').textContent='Verbinding met NAS mislukt'}setTimeout(refreshStatus,2000)}
 function showResults(items){let root=$('results');root.replaceChildren();if(!items.length){root.innerHTML='<div class="empty">Geen artikelen gevonden.</div>';return}for(const item of items){let b=document.createElement('button');b.className='result';let strong=document.createElement('strong');strong.textContent=item.name;let span=document.createElement('span');span.textContent=(item.location||'Geen locatie')+' · '+item.barcode;b.append(strong,span);b.onclick=()=>fillForm(item);root.appendChild(b)}}
 $('search').addEventListener('input',()=>{clearTimeout(searchTimer);let q=$('search').value.trim();if(!q){$('results').innerHTML='<div class="empty">Typ om artikelen te zoeken.</div>';return}searchTimer=setTimeout(async()=>{try{let d=await (await fetch('/api/search?q='+encodeURIComponent(q))).json();showResults(d.items)}catch(e){}},220)});
-$('save').onclick=async()=>{let payload={id:$('itemId').value||null,barcode:$('barcode').value.trim(),name:$('name').value.trim(),location:$('location').value.trim(),notes:$('notes').value.trim()};try{let r=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});let d=await r.json();if(!r.ok)throw Error(d.error||'Opslaan mislukt');fillForm(d.item);$('lastScan').textContent=d.item.barcode;setMessage('Opgeslagen.');if($('search').value.trim())$('search').dispatchEvent(new Event('input'))}catch(e){setMessage(e.message)}};
+$('save').onclick=async()=>{let payload={id:$('itemId').value||null,barcode:$('barcode').value.trim(),name:$('name').value.trim(),location:$('location').value.trim(),notes:$('notes').value.trim()};try{let r=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});let d=await r.json();if(!r.ok)throw Error(d.error||'Opslaan mislukt');fillForm(d.item);$('lastScan').textContent=d.item.barcode;setMessage('Opgeslagen. Naam en locatie staan nu bovenaan bij Scanner.');if($('search').value.trim())$('search').dispatchEvent(new Event('input'))}catch(e){setMessage(e.message)}};
 $('clear').onclick=clearForm;
 $('delete').onclick=async()=>{if(!confirm('Dit artikel verwijderen?'))return;try{let r=await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:$('itemId').value})});let d=await r.json();if(!r.ok)throw Error(d.error||'Verwijderen mislukt');clearForm();setMessage('Artikel verwijderd.');if($('search').value.trim())$('search').dispatchEvent(new Event('input'))}catch(e){setMessage(e.message)}};
+function addLink(container,label,url){let a=document.createElement('a');a.textContent=label;a.href=url;a.target='_blank';a.rel='noopener noreferrer';container.appendChild(a)}
+function catalogQueryLinks(item){let q=(item.name?item.name+' ':'')+item.barcode;let encoded=encodeURIComponent(q);return {google:'https://www.google.com/search?tbm=shop&q='+encoded,web:'https://www.google.com/search?q='+encoded,bol:'https://www.bol.com/nl/nl/s/?searchtext='+encoded,amazon:'https://www.amazon.nl/s?k='+encoded}}
+function renderCatalogItem(item){let root=$('catalogResult');root.replaceChildren();let h=document.createElement('h3');h.textContent=item.found?item.name:'Niet gevonden in openbare catalogi';root.appendChild(h);if(item.image_url&&item.found){let img=document.createElement('img');img.className='product-image';img.src=item.image_url;img.alt=item.name;img.referrerPolicy='no-referrer';root.appendChild(img)}if(item.found){if(item.brand)root.appendChild(Object.assign(document.createElement('p'),{textContent:'Merk/auteur: '+item.brand}));if(item.category)root.appendChild(Object.assign(document.createElement('p'),{textContent:'Categorie: '+item.category}));if(item.quantity)root.appendChild(Object.assign(document.createElement('p'),{textContent:'Inhoud/maat: '+item.quantity}));if(item.description)root.appendChild(Object.assign(document.createElement('p'),{textContent:item.description}));let source=document.createElement('p');source.textContent='Bron: '+(item.source||'openbare database')+(item.cached?' (opgeslagen zoekresultaat)':'');root.appendChild(source);if(item.source_url)addLink(root,'Bekijk bron',item.source_url)}else{let p=document.createElement('p');p.textContent='De barcode is niet gevonden in de openbare productdatabases. Je kunt de winkelzoeklinks hieronder proberen of het artikel handmatig aan je voorraad toevoegen.';root.appendChild(p);if(item.lookup_error){let e=document.createElement('p');e.className='catalog-message';e.textContent='Niet alle online bronnen waren bereikbaar.';root.appendChild(e)}}
+let links=document.createElement('div');links.className='buy-links';let urls=catalogQueryLinks(item);addLink(links,'Google Shopping',urls.google);addLink(links,'Google zoeken',urls.web);addLink(links,'Bol.com',urls.bol);addLink(links,'Amazon.nl',urls.amazon);root.appendChild(links);
+let form=document.createElement('div');form.className='catalog-form';let nameLabel=document.createElement('label');nameLabel.textContent='Naam voor mijn voorraad (aanpasbaar)';let name=document.createElement('input');name.value=item.name||'';name.placeholder='Vul zelf een naam in als online niets is gevonden';let locLabel=document.createElement('label');locLabel.textContent='Locatie in mijn voorraad';let location=document.createElement('input');location.placeholder='Bijvoorbeeld: kast A2';let noteLabel=document.createElement('label');noteLabel.textContent='Notities';let notes=document.createElement('textarea');notes.value=[item.brand,item.category,item.quantity,item.description].filter(Boolean).join(' · ');let save=document.createElement('button');save.className='primary';save.textContent='Opslaan in mijn voorraad';let msg=document.createElement('p');msg.className='catalog-message';save.onclick=async()=>{if(!name.value.trim()){msg.textContent='Vul eerst een naam in.';return}try{let response=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({barcode:item.barcode,name:name.value.trim(),location:location.value.trim(),notes:notes.value.trim()})});let data=await response.json();if(!response.ok)throw Error(data.error||'Opslaan mislukt');setTab('inventory');$('lastScan').textContent=data.item.barcode;fillForm(data.item);setMessage('Opgeslagen vanuit de algemene database.')}catch(e){msg.textContent=e.message}};form.append(nameLabel,name,locLabel,location,noteLabel,notes,save,msg);root.appendChild(form)}
+async function lookupOnline(code){code=(code||'').trim();if(!code)return;$('catalogBarcode').value=code;$('catalogResult').textContent='Zoeken in openbare databases…';setTab('catalog');try{let response=await fetch('/api/lookup?barcode='+encodeURIComponent(code));let data=await response.json();if(!response.ok)throw Error(data.error||'Zoeken mislukt');renderCatalogItem(data.item);loadCatalogRecent()}catch(e){$('catalogResult').textContent='Online zoeken mislukt: '+e.message}}
+$('catalogLookup').onclick=()=>lookupOnline($('catalogBarcode').value);$('catalogBarcode').addEventListener('keydown',e=>{if(e.key==='Enter')lookupOnline($('catalogBarcode').value)});
+function renderRecentCatalog(items){let root=$('catalogRecent');root.replaceChildren();if(!items.length){root.innerHTML='<div class="empty">Nog geen online zoekopdrachten.</div>';return}for(const item of items){let b=document.createElement('button');b.className='recent-row';b.textContent=(item.name||'Onbekend product')+' · '+item.barcode;b.onclick=()=>{setTab('catalog');$('catalogBarcode').value=item.barcode;renderCatalogItem(item)};root.appendChild(b)}}
+async function loadCatalogRecent(){try{let q=$('catalogSearch').value.trim();let url=q?'/api/catalog/search?q='+encodeURIComponent(q):'/api/catalog/recent';let d=await(await fetch(url)).json();renderRecentCatalog(d.items||[])}catch(e){}}
+$('catalogSearch').addEventListener('input',()=>{clearTimeout(catalogTimer);catalogTimer=setTimeout(loadCatalogRecent,200)});
+$('tabInventory').onclick=()=>setTab('inventory');$('tabCatalog').onclick=()=>setTab('catalog');
 pollScans();refreshStatus();
 </script></body></html>'''
 
