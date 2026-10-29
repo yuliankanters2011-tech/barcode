@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 
 DB_PATH = os.environ.get("DB_PATH", "/data/scanbase.db")
 PORT = int(os.environ.get("PORT", "8080"))
+LOOKUP_VERSION = 2
 USB_SYSFS = os.environ.get("USB_SYSFS_DEVICES", "/sys/bus/usb/devices")
 USB_HID_DRIVER = os.environ.get("USB_HID_DRIVER_DIR", "/host-usbhid")
 SCANNER_MODE = os.environ.get("SCANNER_MODE", "external").lower()
@@ -334,11 +335,15 @@ def init_db():
             source_url TEXT NOT NULL DEFAULT '',
             description TEXT NOT NULL DEFAULT '',
             offers_json TEXT NOT NULL DEFAULT '[]',
+            lookup_version INTEGER NOT NULL DEFAULT 2,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )""")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(catalog_cache)")}
         if "offers_json" not in columns:
             conn.execute("ALTER TABLE catalog_cache ADD COLUMN offers_json TEXT NOT NULL DEFAULT '[]'")
+        if "lookup_version" not in columns:
+            # Force a fresh lookup for old negative results after new providers are added.
+            conn.execute("ALTER TABLE catalog_cache ADD COLUMN lookup_version INTEGER NOT NULL DEFAULT 1")
 
 
 def row_to_dict(row):
@@ -367,6 +372,8 @@ def catalog_from_cache(barcode, max_age_hours=24):
     if row is None:
         return None
     item = row_to_dict(row)
+    if int(item.get("lookup_version", 1)) != LOOKUP_VERSION:
+        return None
     try:
         stamp = datetime.strptime(item["updated_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         if (datetime.now(timezone.utc) - stamp).total_seconds() <= max_age_hours * 3600:
@@ -384,17 +391,17 @@ def catalog_from_cache(barcode, max_age_hours=24):
 def save_catalog_result(item):
     with DB_LOCK, db_session() as conn:
         conn.execute("""INSERT INTO catalog_cache
-            (barcode, found, name, brand, category, quantity, image_url, source, source_url, description, offers_json)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            (barcode, found, name, brand, category, quantity, image_url, source, source_url, description, offers_json, lookup_version)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(barcode) DO UPDATE SET found=excluded.found, name=excluded.name,
             brand=excluded.brand, category=excluded.category, quantity=excluded.quantity,
             image_url=excluded.image_url, source=excluded.source, source_url=excluded.source_url,
             description=excluded.description, offers_json=excluded.offers_json,
-            updated_at=CURRENT_TIMESTAMP""",
+            lookup_version=excluded.lookup_version, updated_at=CURRENT_TIMESTAMP""",
             (item["barcode"], int(item["found"]), item.get("name", ""), item.get("brand", ""),
              item.get("category", ""), item.get("quantity", ""), item.get("image_url", ""),
              item.get("source", ""), item.get("source_url", ""), item.get("description", ""),
-             json.dumps(item.get("offers", []), ensure_ascii=False)))
+             json.dumps(item.get("offers", []), ensure_ascii=False), LOOKUP_VERSION))
 
 
 def fetch_fact_product(base, barcode, source_name):
@@ -459,6 +466,116 @@ def fetch_upcitemdb(barcode):
     }
 
 
+MUSICBRAINZ_REQUEST_LOCK = threading.Lock()
+MUSICBRAINZ_LAST_REQUEST = 0.0
+
+
+def fetch_upcmdb_movie(barcode):
+    """Exact UPC/EAN lookup for DVD, Blu-ray and 4K home-media editions."""
+    url = "https://upcmdb.com/v1/demo/lookup/" + quote(barcode, safe="")
+    request = Request(url, headers={"Accept": "application/json",
+                                    "User-Agent": "ScanBase/1.4 barcode inventory"})
+    with urlopen(request, timeout=7) as response:
+        product = json.loads(response.read(1_000_000).decode("utf-8"))
+    title = (product.get("title") or "").strip()
+    if not title or str(product.get("upc") or product.get("ean") or "") not in (barcode, "0" + barcode):
+        return None
+    year = product.get("year") or product.get("omdbYear") or ""
+    format_name = product.get("format", "")
+    category = "DVD / Blu-ray"
+    if "4k" in str(format_name).lower():
+        category = "4K UHD-film"
+    elif "blu" in str(format_name).lower():
+        category = "Blu-ray-film"
+    elif "dvd" in str(format_name).lower():
+        category = "DVD-film"
+    display_name = f"{title} ({year})" if year else title
+    details = [value for value in (format_name, product.get("publisher", ""),
+                                   product.get("runtime", "") + " min" if product.get("runtime") else "",
+                                   product.get("genre", ""), product.get("resolution", ""),
+                                   product.get("subtitles", ""), product.get("plot", "")) if value]
+    imdb_id = product.get("imdbID", "")
+    return {
+        "barcode": barcode, "found": True, "name": display_name,
+        "brand": product.get("director", ""), "category": category,
+        "quantity": format_name, "image_url": product.get("productImageUrl", ""),
+        "source": "UPCMDB", "source_url": f"https://www.imdb.com/title/{quote(imdb_id, safe='')}" if imdb_id else "https://upcmdb.com/demo",
+        "description": " · ".join(details)[:4000], "offers": [],
+    }
+
+
+def fetch_musicbrainz_release(barcode):
+    """Find a music CD by its printed barcode in MusicBrainz."""
+    global MUSICBRAINZ_LAST_REQUEST
+    # MusicBrainz requests clients to stay at or below one request per second/IP.
+    with MUSICBRAINZ_REQUEST_LOCK:
+        delay = 1.1 - (time.monotonic() - MUSICBRAINZ_LAST_REQUEST)
+        if delay > 0:
+            time.sleep(delay)
+        MUSICBRAINZ_LAST_REQUEST = time.monotonic()
+    query = urlencode({"query": f"barcode:{barcode}", "fmt": "json", "limit": "5"})
+    request = Request(
+        "https://musicbrainz.org/ws/2/release/?" + query,
+        headers={"Accept": "application/json",
+                 "User-Agent": "ScanBase/1.4 (https://github.com/ykdigital)"})
+    with urlopen(request, timeout=8) as response:
+        payload = json.loads(response.read(1_000_000).decode("utf-8"))
+    releases = payload.get("releases") or []
+    # Prefer exact matches; do not accidentally identify a neighboring edition.
+    release = next((r for r in releases if str(r.get("barcode", "")) == barcode), None)
+    if not release:
+        return None
+    artists = "".join((part.get("name", "") + (part.get("joinphrase", "") or ""))
+                      for part in release.get("artist-credit", []) if isinstance(part, dict))
+    labels = ", ".join(info.get("label", {}).get("name", "")
+                       for info in release.get("label-info", []) if info.get("label", {}).get("name"))
+    details = [value for value in (release.get("date", ""), labels,
+                                   release.get("country", "")) if value]
+    title = release.get("title", "").strip()
+    if not title:
+        return None
+    return {
+        "barcode": barcode, "found": True, "name": title,
+        "brand": artists, "category": "Muziek-cd", "quantity": "",
+        "image_url": "", "source": "MusicBrainz",
+        "source_url": f"https://musicbrainz.org/release/{quote(release.get('id', ''), safe='')}",
+        "description": " · ".join(details), "offers": [],
+    }
+
+
+def fetch_google_book(barcode):
+    """Look up ISBNs in Google Books, which often indexes school editions."""
+    query = urlencode({"q": "isbn:" + barcode, "maxResults": "5"})
+    request = Request("https://www.googleapis.com/books/v1/volumes?" + query,
+                      headers={"Accept": "application/json",
+                               "User-Agent": "ScanBase/1.4 barcode inventory"})
+    with urlopen(request, timeout=7) as response:
+        payload = json.loads(response.read(1_000_000).decode("utf-8"))
+    for result in payload.get("items", []):
+        info = result.get("volumeInfo") or {}
+        identifiers = {str(identifier.get("identifier", "")).replace("-", "")
+                       for identifier in info.get("industryIdentifiers", [])}
+        if barcode not in identifiers or not info.get("title"):
+            continue
+        authors = ", ".join(info.get("authors", []))
+        categories = ", ".join(info.get("categories", []))
+        details = [value for value in (info.get("publisher", ""),
+                                       info.get("publishedDate", ""),
+                                       f"{info['pageCount']} pagina's" if info.get("pageCount") else "",
+                                       categories) if value]
+        image_links = info.get("imageLinks") or {}
+        return {
+            "barcode": barcode, "found": True, "name": info["title"],
+            "brand": authors, "category": categories or "Boek / ISBN",
+            "quantity": "", "image_url": image_links.get("thumbnail", "").replace("http://", "https://"),
+            "source": "Google Books",
+            "source_url": info.get("infoLink") or f"https://books.google.com/books?vid=ISBN{quote(barcode, safe='')}",
+            "description": (info.get("description", "") or "")[:4000] or " · ".join(details),
+            "offers": [],
+        }
+    return None
+
+
 def lookup_online(barcode, use_cache=True):
     barcode = str(barcode).strip()
     if use_cache:
@@ -467,13 +584,35 @@ def lookup_online(barcode, use_cache=True):
             return cached
 
     errors = []
+    movie_lookup_attempted = False
     try:
         item = fetch_upcitemdb(barcode)
         if item:
+            category_text = str(item.get("category", "")).lower()
+            if any(word in category_text for word in ("dvd", "blu-ray", "movie", "film", "video")):
+                movie_lookup_attempted = True
+                try:
+                    movie = fetch_upcmdb_movie(barcode)
+                    if movie:
+                        save_catalog_result(movie)
+                        return movie
+                except Exception as exc:
+                    errors.append(f"UPCMDB: {type(exc).__name__}")
             save_catalog_result(item)
             return item
     except Exception as exc:
         errors.append(f"UPCitemdb: {type(exc).__name__}")
+
+    # A separate physical-media catalogue has exact lookups for DVD/Blu-ray UPCs.
+    # The public demo route requires no API key; only standard UPC/EAN lengths are tried.
+    if not movie_lookup_attempted and barcode.isdigit() and len(barcode) in (12, 13):
+        try:
+            movie = fetch_upcmdb_movie(barcode)
+            if movie:
+                save_catalog_result(movie)
+                return movie
+        except Exception as exc:
+            errors.append(f"UPCMDB: {type(exc).__name__}")
 
     # Try specialist open barcode catalogues; not every barcode is indexed.
     sources = [
@@ -491,10 +630,30 @@ def lookup_online(barcode, use_cache=True):
         except Exception as exc:
             errors.append(f"{source_name}: {type(exc).__name__}")
 
-    # ISBN barcodes can also be found in Open Library.
+    # MusicBrainz is a specialist barcode source for CD editions.
+    if barcode.isdigit() and 8 <= len(barcode) <= 14:
+        try:
+            item = fetch_musicbrainz_release(barcode)
+            if item:
+                save_catalog_result(item)
+                return item
+        except Exception as exc:
+            errors.append(f"MusicBrainz: {type(exc).__name__}")
+
+    # ISBNs may be school editions; Google Books often has publisher/edition details.
     if len(barcode) in (10, 13) and (barcode.startswith("978") or barcode.startswith("979") or len(barcode) == 10):
         try:
+            item = fetch_google_book(barcode)
+            if item:
+                save_catalog_result(item)
+                return item
+        except Exception as exc:
+            errors.append(f"Google Books: {type(exc).__name__}")
+
+        # Open Library is a second independent ISBN fallback.
+        try:
             url = "https://openlibrary.org/api/books?" + urlencode({
+
                 "bibkeys": "ISBN:" + barcode, "format": "json", "jscmd": "data"})
             request = Request(url, headers={"User-Agent": "ScanBase/1.2 (barcode inventory; read-only lookup)"})
             with urlopen(request, timeout=5) as response:
@@ -521,15 +680,17 @@ def lookup_online(barcode, use_cache=True):
 
 def recent_catalog_items(limit=50):
     with DB_LOCK, db_session() as conn:
-        rows = conn.execute("SELECT * FROM catalog_cache ORDER BY updated_at DESC, rowid DESC LIMIT ?", (limit,)).fetchall()
+        rows = conn.execute("SELECT * FROM catalog_cache WHERE lookup_version=? ORDER BY updated_at DESC, rowid DESC LIMIT ?", (LOOKUP_VERSION, limit)).fetchall()
     return [catalog_row_to_dict(row) for row in rows]
 
 
 def search_catalog_cache(query, limit=50):
     like = f"%{query}%"
     with DB_LOCK, db_session() as conn:
-        rows = conn.execute("""SELECT * FROM catalog_cache WHERE barcode LIKE ? OR name LIKE ? OR brand LIKE ? OR category LIKE ?
-            ORDER BY updated_at DESC, rowid DESC LIMIT ?""", (like, like, like, like, limit)).fetchall()
+        rows = conn.execute("""SELECT * FROM catalog_cache WHERE lookup_version=? AND
+            (barcode LIKE ? OR name LIKE ? OR brand LIKE ? OR category LIKE ?)
+            ORDER BY updated_at DESC, rowid DESC LIMIT ?""",
+            (LOOKUP_VERSION, like, like, like, like, limit)).fetchall()
     return [catalog_row_to_dict(row) for row in rows]
 
 
